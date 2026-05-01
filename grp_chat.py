@@ -158,10 +158,11 @@ with st.sidebar:
     show_sources = st.toggle("Show sources", value=True)
 
     st.divider()
-    st.subheader("💡 Sample Questions")
-    for q in SAMPLE_QUESTIONS:
-        if st.button(q, use_container_width=True, key=q):
-            st.session_state["prefill"] = q
+    with st.expander(f"💡 Sample Questions ({len(SAMPLE_QUESTIONS)})", expanded=False):
+        with st.container(height=260, border=False):
+            for q in SAMPLE_QUESTIONS:
+                if st.button(q, use_container_width=True, key=q):
+                    st.session_state["prefill"] = q
 
     st.divider()
     if st.button("🗑 Clear Chat", use_container_width=True):
