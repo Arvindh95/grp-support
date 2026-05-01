@@ -202,13 +202,28 @@ if page == "💬 Chat":
 
     def _copy_button(text, key):
         safe = json.dumps(text)
-        components.html(
-            "<button onclick='navigator.clipboard.writeText(" + safe +
-            ").then(function(){this.innerText=\"Copied\";var b=this;setTimeout(function(){b.innerText=\"Copy\"},1500)}.bind(this))' "
+        html = (
+            "<button id='cb_" + key + "' "
             "style='background:transparent;border:1px solid rgba(150,150,150,0.35);color:#aaa;padding:3px 10px;border-radius:6px;cursor:pointer;font-size:0.8em'>"
-            "Copy</button>",
-            height=36,
+            "Copy</button>"
+            "<script>(function(){"
+            "  var t=" + safe + ";"
+            "  var b=document.getElementById('cb_" + key + "');"
+            "  b.addEventListener('click', function(){"
+            "    var done=function(){b.innerText='Copied';setTimeout(function(){b.innerText='Copy'},1500)};"
+            "    if (navigator.clipboard && window.isSecureContext) {"
+            "      navigator.clipboard.writeText(t).then(done).catch(function(){fb()});"
+            "    } else { fb(); }"
+            "    function fb(){"
+            "      var ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';"
+            "      document.body.appendChild(ta);ta.focus();ta.select();"
+            "      try{document.execCommand('copy');done();}catch(e){b.innerText='Failed';}"
+            "      document.body.removeChild(ta);"
+            "    }"
+            "  });"
+            "})();</script>"
         )
+        components.html(html, height=36)
 
     pending = st.session_state.pop("pending_submit", None)
 
