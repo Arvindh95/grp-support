@@ -145,10 +145,12 @@ with st.sidebar:
             st.caption(f"{ALL_INDICES[idx]} — {count} docs")
 
     with st.expander(f"📖 Knowledge ({len(knowledge_idx)})", expanded=False):
-        _render_idx(knowledge_idx)
+        with st.container(height=220, border=False):
+            _render_idx(knowledge_idx)
 
     with st.expander(f"🎫 RFS Tickets ({len(ticket_idx)})", expanded=False):
-        _render_idx(ticket_idx)
+        with st.container(height=220, border=False):
+            _render_idx(ticket_idx)
 
     st.divider()
     st.subheader("⚙️ Settings")
