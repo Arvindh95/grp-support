@@ -132,11 +132,23 @@ with st.sidebar:
     except Exception:
         counts = {}
 
-    for idx, desc in ALL_INDICES.items():
-        count = counts.get(idx, "?")
-        st.markdown(f"**{idx}**")
-        st.caption(f"{desc} — {count} docs")
-        st.write("")
+    total_docs = sum(c for c in counts.values() if isinstance(c, int) and c >= 0)
+    st.caption(f"{total_docs:,} docs · {len(ALL_INDICES)} indices")
+
+    knowledge_idx = [k for k in ALL_INDICES if not k.startswith("rfs-tickets-")]
+    ticket_idx    = [k for k in ALL_INDICES if k.startswith("rfs-tickets-")]
+
+    def _render_idx(idx_list):
+        for idx in idx_list:
+            count = counts.get(idx, "?")
+            st.markdown(f"**{idx}**")
+            st.caption(f"{ALL_INDICES[idx]} — {count} docs")
+
+    with st.expander(f"📖 Knowledge ({len(knowledge_idx)})", expanded=False):
+        _render_idx(knowledge_idx)
+
+    with st.expander(f"🎫 RFS Tickets ({len(ticket_idx)})", expanded=False):
+        _render_idx(ticket_idx)
 
     st.divider()
     st.subheader("⚙️ Settings")
