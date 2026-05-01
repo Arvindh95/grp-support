@@ -137,10 +137,10 @@ with st.sidebar:
         st.subheader("💬 Chats")
 
         if st.button("+ New chat", use_container_width=True, key="new_chat_btn"):
-            st.session_state.pop("current_chat_id", None)
-            st.session_state.pop("current_chat_title", None)
-            st.session_state.messages = []
-            st.session_state.editing_idx = None
+            st.session_state.current_chat_id    = None
+            st.session_state.current_chat_title = None
+            st.session_state.messages           = []
+            st.session_state.editing_idx        = None
             st.rerun()
 
         try:
@@ -148,16 +148,24 @@ with st.sidebar:
         except Exception:
             chats = []
 
-        # Auto-load most recent chat on first render; otherwise stay empty until user sends a message
-        if "current_chat_id" not in st.session_state and chats:
-            cid0 = chats[0]["id"]
-            try:
-                full = requests.get(f"{API_URL}/chats/{cid0}", timeout=5).json()
-                st.session_state.current_chat_id    = cid0
-                st.session_state.current_chat_title = full.get("title", "New chat")
-                st.session_state.messages           = full.get("messages", [])
-            except Exception:
-                st.session_state.messages = []
+        # On the very first render (key never set), auto-load most recent chat for convenience.
+        # Once the user clicks + New chat, current_chat_id becomes None and we keep an empty slate.
+        if "current_chat_id" not in st.session_state:
+            if chats:
+                cid0 = chats[0]["id"]
+                try:
+                    full = requests.get(f"{API_URL}/chats/{cid0}", timeout=5).json()
+                    st.session_state.current_chat_id    = cid0
+                    st.session_state.current_chat_title = full.get("title", "New chat")
+                    st.session_state.messages           = full.get("messages", [])
+                except Exception:
+                    st.session_state.current_chat_id    = None
+                    st.session_state.current_chat_title = None
+                    st.session_state.messages           = []
+            else:
+                st.session_state.current_chat_id    = None
+                st.session_state.current_chat_title = None
+                st.session_state.messages           = []
         if "messages" not in st.session_state:
             st.session_state.messages = []
 
@@ -249,8 +257,9 @@ if page == "💬 Chat":
     .empty-state h2 { font-weight: 500; margin-top: 0.5rem; }
     .empty-state p  { color: rgba(180,180,180,0.85); font-size: 0.9rem; }
     .stButton > button { white-space: normal; height: auto; padding: 0.6rem 0.8rem; text-align: left; }
-    [data-testid="stChatMessage"] .stButton > button { background: transparent !important; border: none !important; padding: 4px 8px !important; min-height: 0 !important; height: auto !important; font-size: 1.05em !important; color: rgba(180,180,180,0.6) !important; border-radius: 6px !important; }
-    [data-testid="stChatMessage"] .stButton > button:hover { color: rgba(255,255,255,0.95) !important; background: rgba(255,255,255,0.06) !important; }
+    .icon-btn .stButton > button, [data-testid="stChatMessage"] .stButton > button, .stChatMessage .stButton > button { background: transparent !important; border: none !important; box-shadow: none !important; padding: 4px 10px !important; min-height: 0 !important; height: auto !important; font-size: 1.1em !important; color: rgba(180,180,180,0.6) !important; border-radius: 6px !important; }
+    .icon-btn .stButton > button:hover, [data-testid="stChatMessage"] .stButton > button:hover, .stChatMessage .stButton > button:hover { color: rgba(255,255,255,0.95) !important; background: rgba(255,255,255,0.06) !important; border: none !important; }
+    .icon-btn .stButton > button:focus, [data-testid="stChatMessage"] .stButton > button:focus { box-shadow: none !important; outline: none !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -262,33 +271,8 @@ if page == "💬 Chat":
     USER_AVATAR = "🧑"
     BOT_AVATAR  = "🤖"
 
-    def _copy_button(text, key):
-        safe = json.dumps(text)
-        html = (
-            "<style>"
-            "  body{margin:0;padding:0}"
-            "  .icb{background:transparent;border:none;color:rgba(180,180,180,0.6);padding:4px 8px;border-radius:6px;cursor:pointer;font-size:1.05em;line-height:1;font-family:inherit}"
-            "  .icb:hover{color:rgba(255,255,255,0.95);background:rgba(255,255,255,0.06)}"
-            "</style>"
-            "<button id='cb_" + key + "' class='icb' title='Copy'>\u2398</button>"
-            "<script>(function(){"
-            "  var t=" + safe + ";"
-            "  var b=document.getElementById('cb_" + key + "');"
-            "  b.addEventListener('click', function(){"
-            "    var done=function(){b.innerText='\u2713';setTimeout(function(){b.innerText='\u2398'},1500)};"
-            "    if (navigator.clipboard && window.isSecureContext) {"
-            "      navigator.clipboard.writeText(t).then(done).catch(function(){fb()});"
-            "    } else { fb(); }"
-            "    function fb(){"
-            "      var ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';"
-            "      document.body.appendChild(ta);ta.focus();ta.select();"
-            "      try{document.execCommand('copy');done();}catch(e){b.innerText='x';}"
-            "      document.body.removeChild(ta);"
-            "    }"
-            "  });"
-            "})();</script>"
-        )
-        components.html(html, height=32)
+    def _trigger_copy(text):
+        st.session_state["copy_pending"] = text
 
     pending = st.session_state.pop("pending_submit", None)
 
@@ -341,7 +325,9 @@ if page == "💬 Chat":
                 render_assistant_msg(msg, show_sources, show_images)
                 ac1, ac2, _ = st.columns([1, 1, 18])
                 with ac1:
-                    _copy_button(msg["content"], key="copy_" + str(i))
+                    if st.button("⎘", key="copy_" + str(i), help="Copy"):
+                        _trigger_copy(msg["content"])
+                        st.rerun()
                 with ac2:
                     if i == last_idx:
                         if st.button("↻", key="regen_" + str(i), help="Regenerate"):
@@ -503,6 +489,20 @@ if page == "💬 Chat":
             except Exception:
                 pass
         st.rerun()
+
+    copy_pending = st.session_state.pop("copy_pending", None)
+    if copy_pending is not None:
+        _safe = json.dumps(copy_pending)
+        components.html(
+            "<script>(function(){"
+            "  var t=" + _safe + ";"
+            "  function fb(){var ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';"
+            "    document.body.appendChild(ta);ta.focus();ta.select();try{document.execCommand('copy');}catch(e){}document.body.removeChild(ta);}"
+            "  if (navigator.clipboard && window.isSecureContext) {navigator.clipboard.writeText(t).catch(fb);} else {fb();}"
+            "})();</script>",
+            height=0,
+        )
+        st.toast("Copied")
 
     if st.session_state.messages:
         components.html(
