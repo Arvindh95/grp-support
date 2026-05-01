@@ -137,13 +137,10 @@ with st.sidebar:
         st.subheader("💬 Chats")
 
         if st.button("+ New chat", use_container_width=True, key="new_chat_btn"):
-            try:
-                r = requests.post(f"{API_URL}/chats", json={}, timeout=5).json()
-                st.session_state.current_chat_id    = r["id"]
-                st.session_state.current_chat_title = r["title"]
-                st.session_state.messages           = []
-            except Exception as _e:
-                st.error(f"Could not create chat: {_e}")
+            st.session_state.pop("current_chat_id", None)
+            st.session_state.pop("current_chat_title", None)
+            st.session_state.messages = []
+            st.session_state.editing_idx = None
             st.rerun()
 
         try:
@@ -151,26 +148,18 @@ with st.sidebar:
         except Exception:
             chats = []
 
-        # Auto-pick most recent (or create) on first render
-        if "current_chat_id" not in st.session_state:
-            if chats:
-                cid0 = chats[0]["id"]
-                try:
-                    full = requests.get(f"{API_URL}/chats/{cid0}", timeout=5).json()
-                    st.session_state.current_chat_id    = cid0
-                    st.session_state.current_chat_title = full.get("title", "New chat")
-                    st.session_state.messages           = full.get("messages", [])
-                except Exception:
-                    st.session_state.messages = []
-            else:
-                try:
-                    r = requests.post(f"{API_URL}/chats", json={}, timeout=5).json()
-                    st.session_state.current_chat_id    = r["id"]
-                    st.session_state.current_chat_title = r["title"]
-                    st.session_state.messages           = []
-                    chats = [r]
-                except Exception:
-                    pass
+        # Auto-load most recent chat on first render; otherwise stay empty until user sends a message
+        if "current_chat_id" not in st.session_state and chats:
+            cid0 = chats[0]["id"]
+            try:
+                full = requests.get(f"{API_URL}/chats/{cid0}", timeout=5).json()
+                st.session_state.current_chat_id    = cid0
+                st.session_state.current_chat_title = full.get("title", "New chat")
+                st.session_state.messages           = full.get("messages", [])
+            except Exception:
+                st.session_state.messages = []
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
 
         with st.container(height=300, border=False):
             for c in chats:
@@ -259,6 +248,8 @@ if page == "💬 Chat":
     .empty-state h2 { font-weight: 500; margin-top: 0.5rem; }
     .empty-state p  { color: rgba(180,180,180,0.85); font-size: 0.9rem; }
     .stButton > button { white-space: normal; height: auto; padding: 0.6rem 0.8rem; text-align: left; }
+    [data-testid="stChatMessage"] .stButton > button { background: transparent !important; border: none !important; padding: 4px 8px !important; min-height: 0 !important; height: auto !important; font-size: 1.05em !important; color: rgba(180,180,180,0.6) !important; border-radius: 6px !important; }
+    [data-testid="stChatMessage"] .stButton > button:hover { color: rgba(255,255,255,0.95) !important; background: rgba(255,255,255,0.06) !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -273,27 +264,30 @@ if page == "💬 Chat":
     def _copy_button(text, key):
         safe = json.dumps(text)
         html = (
-            "<button id='cb_" + key + "' "
-            "style='background:transparent;border:1px solid rgba(150,150,150,0.35);color:#aaa;padding:3px 10px;border-radius:6px;cursor:pointer;font-size:0.8em'>"
-            "Copy</button>"
+            "<style>"
+            "  body{margin:0;padding:0}"
+            "  .icb{background:transparent;border:none;color:rgba(180,180,180,0.6);padding:4px 8px;border-radius:6px;cursor:pointer;font-size:1.05em;line-height:1;font-family:inherit}"
+            "  .icb:hover{color:rgba(255,255,255,0.95);background:rgba(255,255,255,0.06)}"
+            "</style>"
+            "<button id='cb_" + key + "' class='icb' title='Copy'>\u2398</button>"
             "<script>(function(){"
             "  var t=" + safe + ";"
             "  var b=document.getElementById('cb_" + key + "');"
             "  b.addEventListener('click', function(){"
-            "    var done=function(){b.innerText='Copied';setTimeout(function(){b.innerText='Copy'},1500)};"
+            "    var done=function(){b.innerText='\u2713';setTimeout(function(){b.innerText='\u2398'},1500)};"
             "    if (navigator.clipboard && window.isSecureContext) {"
             "      navigator.clipboard.writeText(t).then(done).catch(function(){fb()});"
             "    } else { fb(); }"
             "    function fb(){"
             "      var ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';"
             "      document.body.appendChild(ta);ta.focus();ta.select();"
-            "      try{document.execCommand('copy');done();}catch(e){b.innerText='Failed';}"
+            "      try{document.execCommand('copy');done();}catch(e){b.innerText='x';}"
             "      document.body.removeChild(ta);"
             "    }"
             "  });"
             "})();</script>"
         )
-        components.html(html, height=36)
+        components.html(html, height=32)
 
     pending = st.session_state.pop("pending_submit", None)
 
@@ -328,21 +322,28 @@ if page == "💬 Chat":
                         st.session_state.editing_idx = None
                         st.rerun()
                 else:
-                    st.markdown(msg["content"])
-                    if msg.get("attached_names"):
-                        st.caption("Attached: " + ", ".join(msg["attached_names"]))
                     if i == last_user_idx:
-                        if st.button("Edit", key="edit_btn_" + str(i)):
-                            st.session_state.editing_idx = i
-                            st.rerun()
+                        umsg_col, uedit_col = st.columns([20, 1])
+                        with umsg_col:
+                            st.markdown(msg["content"])
+                            if msg.get("attached_names"):
+                                st.caption("Attached: " + ", ".join(msg["attached_names"]))
+                        with uedit_col:
+                            if st.button("✎", key="edit_btn_" + str(i), help="Edit"):
+                                st.session_state.editing_idx = i
+                                st.rerun()
+                    else:
+                        st.markdown(msg["content"])
+                        if msg.get("attached_names"):
+                            st.caption("Attached: " + ", ".join(msg["attached_names"]))
             else:
                 render_assistant_msg(msg, show_sources, show_images)
-                ac1, ac2, _ = st.columns([1, 1, 4])
+                ac1, ac2, _ = st.columns([1, 1, 18])
                 with ac1:
                     _copy_button(msg["content"], key="copy_" + str(i))
                 with ac2:
                     if i == last_idx:
-                        if st.button("Regenerate", key="regen_" + str(i)):
+                        if st.button("↻", key="regen_" + str(i), help="Regenerate"):
                             st.session_state.messages.pop()
                             if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
                                 last_user = st.session_state.messages[-1]
@@ -476,6 +477,15 @@ if page == "💬 Chat":
         })
 
         cid = st.session_state.get("current_chat_id")
+        if not cid:
+            try:
+                r = requests.post(f"{API_URL}/chats", json={}, timeout=5).json()
+                cid = r["id"]
+                st.session_state.current_chat_id    = cid
+                st.session_state.current_chat_title = r["title"]
+            except Exception:
+                cid = None
+
         if cid:
             payload = {"messages": st.session_state.messages}
             if st.session_state.get("current_chat_title", "New chat") == "New chat":
