@@ -133,6 +133,80 @@ with st.sidebar:
     )
     st.divider()
 
+    if page == "💬 Chat":
+        st.subheader("💬 Chats")
+
+        if st.button("+ New chat", use_container_width=True, key="new_chat_btn"):
+            try:
+                r = requests.post(f"{API_URL}/chats", json={}, timeout=5).json()
+                st.session_state.current_chat_id    = r["id"]
+                st.session_state.current_chat_title = r["title"]
+                st.session_state.messages           = []
+            except Exception as _e:
+                st.error(f"Could not create chat: {_e}")
+            st.rerun()
+
+        try:
+            chats = requests.get(f"{API_URL}/chats", timeout=5).json()
+        except Exception:
+            chats = []
+
+        # Auto-pick most recent (or create) on first render
+        if "current_chat_id" not in st.session_state:
+            if chats:
+                cid0 = chats[0]["id"]
+                try:
+                    full = requests.get(f"{API_URL}/chats/{cid0}", timeout=5).json()
+                    st.session_state.current_chat_id    = cid0
+                    st.session_state.current_chat_title = full.get("title", "New chat")
+                    st.session_state.messages           = full.get("messages", [])
+                except Exception:
+                    st.session_state.messages = []
+            else:
+                try:
+                    r = requests.post(f"{API_URL}/chats", json={}, timeout=5).json()
+                    st.session_state.current_chat_id    = r["id"]
+                    st.session_state.current_chat_title = r["title"]
+                    st.session_state.messages           = []
+                    chats = [r]
+                except Exception:
+                    pass
+
+        with st.container(height=300, border=False):
+            for c in chats:
+                cid = c["id"]
+                title = c.get("title") or "New chat"
+                if len(title) > 38:
+                    title = title[:38] + "…"
+                is_active = cid == st.session_state.get("current_chat_id")
+                col_t, col_d = st.columns([5, 1])
+                with col_t:
+                    label = ("→ " if is_active else "  ") + title
+                    if st.button(label, key=f"chat_load_{cid}", use_container_width=True):
+                        if not is_active:
+                            try:
+                                full = requests.get(f"{API_URL}/chats/{cid}", timeout=5).json()
+                                st.session_state.current_chat_id    = cid
+                                st.session_state.current_chat_title = full.get("title", "New chat")
+                                st.session_state.messages           = full.get("messages", [])
+                                st.session_state.editing_idx        = None
+                            except Exception as _e:
+                                st.error(f"Could not load chat: {_e}")
+                            st.rerun()
+                with col_d:
+                    if st.button("🗑", key=f"chat_del_{cid}", help="Delete chat"):
+                        try:
+                            requests.delete(f"{API_URL}/chats/{cid}", timeout=5)
+                        except Exception:
+                            pass
+                        if cid == st.session_state.get("current_chat_id"):
+                            st.session_state.pop("current_chat_id", None)
+                            st.session_state.pop("current_chat_title", None)
+                            st.session_state.messages = []
+                        st.rerun()
+
+        st.divider()
+
     st.subheader("📚 Knowledge Base")
     try:
         r = requests.get(f"{API_URL}/indices", timeout=5)
@@ -165,10 +239,6 @@ with st.sidebar:
     show_images  = st.toggle("Show screenshots", value=True)
     show_sources = st.toggle("Show sources", value=True)
 
-    st.divider()
-    if st.button("🗑 Clear Chat", use_container_width=True):
-        st.session_state.messages = []
-        st.rerun()
 
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
@@ -404,6 +474,23 @@ if page == "💬 Chat":
             "images": images, "sources": sources,
             "context_used": ctx, "expanded_query": expanded,
         })
+
+        cid = st.session_state.get("current_chat_id")
+        if cid:
+            payload = {"messages": st.session_state.messages}
+            if st.session_state.get("current_chat_title", "New chat") == "New chat":
+                first_user = next(
+                    (m["content"] for m in st.session_state.messages if m["role"] == "user"),
+                    None,
+                )
+                if first_user:
+                    new_title = first_user[:50] + ("…" if len(first_user) > 50 else "")
+                    payload["title"] = new_title
+                    st.session_state.current_chat_title = new_title
+            try:
+                requests.put(f"{API_URL}/chats/{cid}", json=payload, timeout=10)
+            except Exception:
+                pass
         st.rerun()
 
     if st.session_state.messages:
