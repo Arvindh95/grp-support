@@ -161,39 +161,40 @@ with st.sidebar:
         if "messages" not in st.session_state:
             st.session_state.messages = []
 
-        with st.container(height=300, border=False):
-            for c in chats:
-                cid = c["id"]
-                title = c.get("title") or "New chat"
-                if len(title) > 38:
-                    title = title[:38] + "…"
-                is_active = cid == st.session_state.get("current_chat_id")
-                col_t, col_d = st.columns([5, 1])
-                with col_t:
-                    label = ("→ " if is_active else "  ") + title
-                    if st.button(label, key=f"chat_load_{cid}", use_container_width=True):
-                        if not is_active:
+        if chats:
+            list_h = min(300, 56 * len(chats) + 8)
+            with st.container(height=list_h, border=False):
+                for c in chats:
+                    cid = c["id"]
+                    title = c.get("title") or "New chat"
+                    if len(title) > 38:
+                        title = title[:38] + "…"
+                    is_active = cid == st.session_state.get("current_chat_id")
+                    col_t, col_d = st.columns([5, 1])
+                    with col_t:
+                        label = ("→ " if is_active else "  ") + title
+                        if st.button(label, key=f"chat_load_{cid}", use_container_width=True):
+                            if not is_active:
+                                try:
+                                    full = requests.get(f"{API_URL}/chats/{cid}", timeout=5).json()
+                                    st.session_state.current_chat_id    = cid
+                                    st.session_state.current_chat_title = full.get("title", "New chat")
+                                    st.session_state.messages           = full.get("messages", [])
+                                    st.session_state.editing_idx        = None
+                                except Exception as _e:
+                                    st.error(f"Could not load chat: {_e}")
+                                st.rerun()
+                    with col_d:
+                        if st.button("🗑", key=f"chat_del_{cid}", help="Delete chat"):
                             try:
-                                full = requests.get(f"{API_URL}/chats/{cid}", timeout=5).json()
-                                st.session_state.current_chat_id    = cid
-                                st.session_state.current_chat_title = full.get("title", "New chat")
-                                st.session_state.messages           = full.get("messages", [])
-                                st.session_state.editing_idx        = None
-                            except Exception as _e:
-                                st.error(f"Could not load chat: {_e}")
+                                requests.delete(f"{API_URL}/chats/{cid}", timeout=5)
+                            except Exception:
+                                pass
+                            if cid == st.session_state.get("current_chat_id"):
+                                st.session_state.pop("current_chat_id", None)
+                                st.session_state.pop("current_chat_title", None)
+                                st.session_state.messages = []
                             st.rerun()
-                with col_d:
-                    if st.button("🗑", key=f"chat_del_{cid}", help="Delete chat"):
-                        try:
-                            requests.delete(f"{API_URL}/chats/{cid}", timeout=5)
-                        except Exception:
-                            pass
-                        if cid == st.session_state.get("current_chat_id"):
-                            st.session_state.pop("current_chat_id", None)
-                            st.session_state.pop("current_chat_title", None)
-                            st.session_state.messages = []
-                        st.rerun()
-
         st.divider()
 
     st.subheader("📚 Knowledge Base")
