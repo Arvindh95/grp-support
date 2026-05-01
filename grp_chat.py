@@ -5,6 +5,7 @@ Run: streamlit run grp_chat.py
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import requests, urllib3, re, json
 import pandas as pd
 
@@ -193,26 +194,87 @@ if page == "💬 Chat":
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "editing_idx" not in st.session_state:
+        st.session_state.editing_idx = None
 
     USER_AVATAR = "🧑"
     BOT_AVATAR  = "🤖"
 
-    for msg in st.session_state.messages:
+    def _copy_button(text, key):
+        safe = json.dumps(text)
+        components.html(
+            "<button onclick='navigator.clipboard.writeText(" + safe +
+            ").then(function(){this.innerText=\"Copied\";var b=this;setTimeout(function(){b.innerText=\"Copy\"},1500)}.bind(this))' "
+            "style='background:transparent;border:1px solid rgba(150,150,150,0.35);color:#aaa;padding:3px 10px;border-radius:6px;cursor:pointer;font-size:0.8em'>"
+            "Copy</button>",
+            height=36,
+        )
+
+    pending = st.session_state.pop("pending_submit", None)
+
+    last_idx = len(st.session_state.messages) - 1
+    last_user_idx = max(
+        (i for i, m in enumerate(st.session_state.messages) if m["role"] == "user"),
+        default=-1,
+    )
+
+    for i, msg in enumerate(st.session_state.messages):
         avatar = USER_AVATAR if msg["role"] == "user" else BOT_AVATAR
         with st.chat_message(msg["role"], avatar=avatar):
-            if msg["role"] == "assistant":
-                render_assistant_msg(msg, show_sources, show_images)
+            if msg["role"] == "user":
+                if st.session_state.editing_idx == i:
+                    new_content = st.text_area(
+                        "Edit message", value=msg["content"], key="edit_ta_" + str(i),
+                        label_visibility="collapsed",
+                    )
+                    c1, c2, _ = st.columns([1, 1, 4])
+                    if c1.button("Save", key="edit_save_" + str(i), type="primary"):
+                        st.session_state.messages[i]["content"] = new_content
+                        st.session_state.messages = st.session_state.messages[: i + 1]
+                        st.session_state.editing_idx = None
+                        st.session_state.pending_submit = {
+                            "text": new_content,
+                            "skip_user_append": True,
+                            "attached_paths": [],
+                            "attached_names": msg.get("attached_names", []),
+                        }
+                        st.rerun()
+                    if c2.button("Cancel", key="edit_cancel_" + str(i)):
+                        st.session_state.editing_idx = None
+                        st.rerun()
+                else:
+                    st.markdown(msg["content"])
+                    if msg.get("attached_names"):
+                        st.caption("Attached: " + ", ".join(msg["attached_names"]))
+                    if i == last_user_idx:
+                        if st.button("Edit", key="edit_btn_" + str(i)):
+                            st.session_state.editing_idx = i
+                            st.rerun()
             else:
-                st.markdown(msg["content"])
-                if msg.get("attached_names"):
-                    st.caption("📎 " + ", ".join(msg["attached_names"]))
+                render_assistant_msg(msg, show_sources, show_images)
+                ac1, ac2, _ = st.columns([1, 1, 4])
+                with ac1:
+                    _copy_button(msg["content"], key="copy_" + str(i))
+                with ac2:
+                    if i == last_idx:
+                        if st.button("Regenerate", key="regen_" + str(i)):
+                            st.session_state.messages.pop()
+                            if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+                                last_user = st.session_state.messages[-1]
+                                st.session_state.pending_submit = {
+                                    "text": last_user["content"],
+                                    "skip_user_append": True,
+                                    "attached_paths": [],
+                                    "attached_names": last_user.get("attached_names", []),
+                                }
+                            st.rerun()
 
-    if not st.session_state.messages:
+    if not st.session_state.messages and not pending:
         st.markdown(
             "<div class='empty-state'>"
             "<h1>🤖</h1>"
             "<h2>How can I help with GRP today?</h2>"
-            "<p>Ask about procedures, past RFS tickets, fix scripts — or attach a file.</p>"
+            "<p>Ask about procedures, past RFS tickets, fix scripts - or attach a file.</p>"
             "</div>",
             unsafe_allow_html=True,
         )
@@ -220,7 +282,7 @@ if page == "💬 Chat":
         cols = st.columns(2)
         for i, q in enumerate(SAMPLE_QUESTIONS[:6]):
             with cols[i % 2]:
-                if st.button(q, key=f"chip_{i}", use_container_width=True):
+                if st.button(q, key="chip_" + str(i), use_container_width=True):
                     st.session_state["prefill"] = q
                     st.rerun()
 
@@ -234,7 +296,16 @@ if page == "💬 Chat":
 
     text = None
     raw_files = []
-    if user_input:
+    attached_paths_pre = []
+    attached_names_pre = []
+    skip_user_append = False
+
+    if pending:
+        text = pending["text"]
+        attached_paths_pre = pending.get("attached_paths", [])
+        attached_names_pre = pending.get("attached_names", [])
+        skip_user_append = pending.get("skip_user_append", False)
+    elif user_input:
         if isinstance(user_input, str):
             text = user_input
         else:
@@ -244,30 +315,34 @@ if page == "💬 Chat":
         text = prefill
 
     if text:
-        attached_paths, attached_names = [], []
-        for f in raw_files:
-            try:
-                r = requests.post(
-                    f"{API_URL}/upload-chat-file",
-                    files={"file": (f.name, f.getvalue(), f.type)},
-                    timeout=60,
-                )
-                if r.status_code == 200:
-                    d = r.json()
-                    attached_paths.append(d["path"])
-                    attached_names.append(d["name"])
-            except Exception:
-                pass
+        if raw_files:
+            attached_paths, attached_names = [], []
+            for f in raw_files:
+                try:
+                    r = requests.post(
+                        f"{API_URL}/upload-chat-file",
+                        files={"file": (f.name, f.getvalue(), f.type)},
+                        timeout=60,
+                    )
+                    if r.status_code == 200:
+                        d = r.json()
+                        attached_paths.append(d["path"])
+                        attached_names.append(d["name"])
+                except Exception:
+                    pass
+        else:
+            attached_paths = attached_paths_pre
+            attached_names = attached_names_pre
 
-        st.session_state.messages.append({
-            "role": "user", "content": text,
-            "attached_names": attached_names,
-        })
-
-        with st.chat_message("user", avatar=USER_AVATAR):
-            st.markdown(text)
-            if attached_names:
-                st.caption("📎 " + ", ".join(attached_names))
+        if not skip_user_append:
+            st.session_state.messages.append({
+                "role": "user", "content": text,
+                "attached_names": attached_names,
+            })
+            with st.chat_message("user", avatar=USER_AVATAR):
+                st.markdown(text)
+                if attached_names:
+                    st.caption("Attached: " + ", ".join(attached_names))
 
         with st.chat_message("assistant", avatar=BOT_AVATAR):
             with st.spinner("Searching knowledge base..."):
@@ -283,7 +358,7 @@ if page == "💬 Chat":
                         json={"question": text, "top_k": 5,
                               "include_images": show_images, "history": history,
                               "attached_files": attached_paths},
-                        timeout=250
+                        timeout=250,
                     )
                     if resp.status_code == 200:
                         data     = resp.json()
@@ -296,14 +371,14 @@ if page == "💬 Chat":
                         answer = f"API error {resp.status_code}: {resp.text[:200]}"
                         images, sources, ctx, expanded = [], [], 0, None
                 except requests.exceptions.Timeout:
-                    answer = "Request timed out — try a simpler question."
+                    answer = "Request timed out - try a simpler question."
                     images, sources, ctx, expanded = [], [], 0, None
                 except Exception as e:
                     answer = f"Connection error: {e}"
                     images, sources, ctx, expanded = [], [], 0, None
 
             if expanded == "clarification_needed":
-                st.info(f"❓ {answer}")
+                st.info(answer)
             else:
                 st.markdown(answer)
                 if ctx:
@@ -315,6 +390,16 @@ if page == "💬 Chat":
             "context_used": ctx, "expanded_query": expanded,
         })
         st.rerun()
+
+    if st.session_state.messages:
+        components.html(
+            "<script>"
+            "const doc = window.parent.document;"
+            "const target = doc.querySelector('section[data-testid=\"stMain\"]') || doc.scrollingElement || doc.body;"
+            "target.scrollTo({top: target.scrollHeight, behavior: 'smooth'});"
+            "</script>",
+            height=0,
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — IMAGE MANAGER
