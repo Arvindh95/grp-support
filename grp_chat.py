@@ -125,6 +125,13 @@ with st.sidebar:
     st.caption("Powered by Claude + Elasticsearch")
     st.divider()
 
+    page = st.radio(
+        "Section",
+        ["💬 Chat", "🖼 Image Manager", "📤 Upload Documents"],
+        label_visibility="collapsed",
+    )
+    st.divider()
+
     st.subheader("📚 Knowledge Base")
     try:
         r = requests.get(f"{API_URL}/indices", timeout=5)
@@ -171,13 +178,13 @@ with st.sidebar:
 
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-tab_chat, tab_images, tab_docs = st.tabs(["💬 Chat", "🖼 Image Manager", "📤 Upload Documents"])
+# Sections rendered conditionally below based on sidebar selection (page).
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — CHAT
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_chat:
+if page == "💬 Chat":
     st.header("GRP ERP Support Assistant")
     st.caption("Ask about system procedures or past support tickets")
 
@@ -314,7 +321,7 @@ with tab_chat:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — IMAGE MANAGER
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_images:
+elif page == "🖼 Image Manager":
     st.header("Manual Image Manager")
     st.caption("Upload or remove screenshots linked to manual sections")
 
@@ -406,7 +413,7 @@ with tab_images:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — UPLOAD DOCUMENTS
 # ══════════════════════════════════════════════════════════════════════════════
-with tab_docs:
+elif page == "📤 Upload Documents":
     st.header("Upload & Index Documents")
     st.caption("Add new knowledge to the AI — files are parsed, embedded, and indexed into Elasticsearch")
 
