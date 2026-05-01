@@ -185,89 +185,98 @@ with st.sidebar:
 # TAB 1 — CHAT
 # ══════════════════════════════════════════════════════════════════════════════
 if page == "💬 Chat":
-    st.header("GRP ERP Support Assistant")
-    st.caption("Ask about system procedures or past support tickets")
+    st.markdown("""
+    <style>
+    section[data-testid="stMain"] .block-container { max-width: 820px; padding-top: 2rem; padding-bottom: 6rem; }
+    [data-testid="stChatMessage"] { padding: 0.8rem 1rem; border-radius: 12px; margin-bottom: 0.8rem; }
+    [data-testid="stChatMessage"] p { line-height: 1.55; }
+    .empty-state { text-align: center; padding: 3rem 1rem 1rem; }
+    .empty-state h1 { font-size: 3rem; margin: 0; }
+    .empty-state h2 { font-weight: 500; margin-top: 0.5rem; }
+    .empty-state p  { color: rgba(180,180,180,0.85); font-size: 0.9rem; }
+    .stButton > button { white-space: normal; height: auto; padding: 0.6rem 0.8rem; text-align: left; }
+    </style>
+    """, unsafe_allow_html=True)
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    if "chat_attached" not in st.session_state:
-        st.session_state.chat_attached = []
-    if "chat_uploader_key" not in st.session_state:
-        st.session_state.chat_uploader_key = 0
+
+    USER_AVATAR = "🧑"
+    BOT_AVATAR  = "🤖"
 
     for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
+        avatar = USER_AVATAR if msg["role"] == "user" else BOT_AVATAR
+        with st.chat_message(msg["role"], avatar=avatar):
             if msg["role"] == "assistant":
                 render_assistant_msg(msg, show_sources, show_images)
             else:
                 st.markdown(msg["content"])
+                if msg.get("attached_names"):
+                    st.caption("📎 " + ", ".join(msg["attached_names"]))
 
-    with st.expander(
-        f"📎 Attach files for this question ({len(st.session_state.chat_attached)} attached)",
-        expanded=False,
-    ):
-        upl = st.file_uploader(
-            "Drop PDF / DOCX / MD / TXT / image — Claude reads them when answering",
-            type=["pdf", "docx", "md", "txt", "csv", "png", "jpg", "jpeg", "webp"],
-            accept_multiple_files=True,
-            key=f"chat_upl_{st.session_state.chat_uploader_key}",
+    if not st.session_state.messages:
+        st.markdown(
+            "<div class='empty-state'>"
+            "<h1>🤖</h1>"
+            "<h2>How can I help with GRP today?</h2>"
+            "<p>Ask about procedures, past RFS tickets, fix scripts — or attach a file.</p>"
+            "</div>",
+            unsafe_allow_html=True,
         )
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            if st.button("Upload", type="primary", disabled=not upl, key="chat_upload_btn"):
-                ok, fail = 0, 0
-                for f in upl:
-                    try:
-                        r = requests.post(
-                            f"{API_URL}/upload-chat-file",
-                            files={"file": (f.name, f.getvalue(), f.type)},
-                            timeout=60,
-                        )
-                        if r.status_code == 200:
-                            d = r.json()
-                            st.session_state.chat_attached.append(
-                                {"path": d["path"], "name": d["name"]}
-                            )
-                            ok += 1
-                        else:
-                            fail += 1
-                            st.error(f"{f.name}: {r.status_code} {r.text[:120]}")
-                    except Exception as e:
-                        fail += 1
-                        st.error(f"{f.name}: {e}")
-                if ok:
-                    st.success(f"Attached {ok} file(s)")
-                    st.session_state.chat_uploader_key += 1
+        st.caption("Suggested questions")
+        cols = st.columns(2)
+        for i, q in enumerate(SAMPLE_QUESTIONS[:6]):
+            with cols[i % 2]:
+                if st.button(q, key=f"chip_{i}", use_container_width=True):
+                    st.session_state["prefill"] = q
                     st.rerun()
-        with c2:
-            if st.button("Clear attached", disabled=not st.session_state.chat_attached, key="chat_clear_btn"):
-                st.session_state.chat_attached = []
-                st.session_state.chat_uploader_key += 1
-                st.rerun()
-
-        if st.session_state.chat_attached:
-            for a in st.session_state.chat_attached:
-                st.caption(f"• {a['name']}")
 
     prefill = st.session_state.pop("prefill", "")
-    prompt  = st.chat_input("Ask about GRP system or past RFS tickets...")
-    if not prompt and prefill:
-        prompt = prefill
 
-    if prompt:
-        attached_paths = [a["path"] for a in st.session_state.chat_attached]
-        attached_names = [a["name"] for a in st.session_state.chat_attached]
+    user_input = st.chat_input(
+        "Ask about GRP system or past RFS tickets...",
+        accept_file="multiple",
+        file_type=["pdf", "docx", "md", "txt", "csv", "png", "jpg", "jpeg", "webp"],
+    )
+
+    text = None
+    raw_files = []
+    if user_input:
+        if isinstance(user_input, str):
+            text = user_input
+        else:
+            text = user_input.text
+            raw_files = user_input.files or []
+    if not text and prefill:
+        text = prefill
+
+    if text:
+        attached_paths, attached_names = [], []
+        for f in raw_files:
+            try:
+                r = requests.post(
+                    f"{API_URL}/upload-chat-file",
+                    files={"file": (f.name, f.getvalue(), f.type)},
+                    timeout=60,
+                )
+                if r.status_code == 200:
+                    d = r.json()
+                    attached_paths.append(d["path"])
+                    attached_names.append(d["name"])
+            except Exception:
+                pass
+
         st.session_state.messages.append({
-            "role": "user", "content": prompt,
+            "role": "user", "content": text,
             "attached_names": attached_names,
         })
 
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        with st.chat_message("user", avatar=USER_AVATAR):
+            st.markdown(text)
             if attached_names:
                 st.caption("📎 " + ", ".join(attached_names))
 
-        with st.chat_message("assistant"):
+        with st.chat_message("assistant", avatar=BOT_AVATAR):
             with st.spinner("Searching knowledge base..."):
                 history = [
                     {"role": m["role"], "content": m["content"]}
@@ -278,7 +287,7 @@ if page == "💬 Chat":
                 try:
                     resp = requests.post(
                         f"{API_URL}/query",
-                        json={"question": prompt, "top_k": 5,
+                        json={"question": text, "top_k": 5,
                               "include_images": show_images, "history": history,
                               "attached_files": attached_paths},
                         timeout=250
@@ -293,7 +302,6 @@ if page == "💬 Chat":
                     else:
                         answer = f"API error {resp.status_code}: {resp.text[:200]}"
                         images, sources, ctx, expanded = [], [], 0, None
-
                 except requests.exceptions.Timeout:
                     answer = "Request timed out — try a simpler question."
                     images, sources, ctx, expanded = [], [], 0, None
@@ -313,10 +321,7 @@ if page == "💬 Chat":
             "images": images, "sources": sources,
             "context_used": ctx, "expanded_query": expanded,
         })
-        st.session_state.chat_attached = []
-        st.session_state.chat_uploader_key += 1
         st.rerun()
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — IMAGE MANAGER
