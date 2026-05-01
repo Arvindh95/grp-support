@@ -10,7 +10,7 @@ import pandas as pd
 
 urllib3.disable_warnings()
 
-API_URL = "http://173.212.247.3:8000"
+API_URL = "http://127.0.0.1:8000"
 
 ALL_INDICES = {
     "grp-manuals":          "GRP System Manuals",
