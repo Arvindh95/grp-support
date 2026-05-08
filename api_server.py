@@ -30,6 +30,32 @@ JWT_ALG     = "HS256"
 JWT_TTL_HOURS = int(os.environ.get("JWT_TTL_HOURS", "12"))
 IMG_BASE    = os.environ.get("IMG_BASE",    "http://173.212.247.3:8080")
 IMG_DIR     = os.environ.get("IMG_DIR",     "/opt/grp-manuals/Doc-Images")
+# Public base used to render signed image URLs back to the frontend. nginx
+# is expected to proxy this to the FastAPI /images/ route. Falls back to IMG_BASE.
+IMG_PUBLIC_BASE = os.environ.get("IMG_PUBLIC_BASE", IMG_BASE).rstrip("/")
+# Signed-URL TTL in seconds (default = JWT TTL).
+IMG_SIGN_TTL    = int(os.environ.get("IMG_SIGN_TTL", str(JWT_TTL_HOURS * 3600)))
+
+# Cost / budget config — defaults to Sonnet 4.6 list pricing per 1M tokens (USD).
+COST_INPUT_PER_M  = float(os.environ.get("COST_INPUT_PER_M",  "3.00"))
+COST_OUTPUT_PER_M = float(os.environ.get("COST_OUTPUT_PER_M", "15.00"))
+COST_CACHE_PER_M  = float(os.environ.get("COST_CACHE_PER_M",  "0.30"))
+# Hard cap on monthly tokens (input+output, billed). 0 = unlimited.
+MONTHLY_TOKEN_BUDGET = int(os.environ.get("MONTHLY_TOKEN_BUDGET", "0"))
+
+# External alerting + email
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER or "noreply@grp-support.local").strip()
+SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").lower() in ("1", "true", "yes")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://173.212.247.3:8081").rstrip("/")
+
+# Index for service / integration API keys
+API_KEYS_INDEX = "grp-api-keys"
+RESET_TOKENS_INDEX = "grp-reset-tokens"
 
 CHAT_UPLOAD_DIR = os.environ.get("CHAT_UPLOAD_DIR", "/tmp/grp-chat")
 os.makedirs(CHAT_UPLOAD_DIR, exist_ok=True)
@@ -119,6 +145,33 @@ AUDIT_MAPPING = {
             "answer_chars":   {"type": "long"},
             "status":         {"type": "keyword"},
             "error":          {"type": "text"},
+        }
+    }
+}
+
+API_KEYS_MAPPING = {
+    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {
+        "properties": {
+            "key_hash":   {"type": "keyword", "index": True},
+            "name":       {"type": "text"},
+            "owner":      {"type": "keyword"},
+            "role":       {"type": "keyword"},
+            "created_at": {"type": "long"},
+            "last_used":  {"type": "long"},
+            "revoked":    {"type": "boolean"},
+        }
+    }
+}
+
+RESET_TOKENS_MAPPING = {
+    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {
+        "properties": {
+            "token_hash": {"type": "keyword", "index": True},
+            "email":      {"type": "keyword"},
+            "expires_at": {"type": "long"},
+            "used":       {"type": "boolean"},
         }
     }
 }
@@ -299,7 +352,10 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     """Ensure auxiliary indices exist on startup."""
-    for idx, mapping in [(CODE_INDEX, CODE_MAPPING), (CHATS_INDEX, CHATS_MAPPING), (USERS_INDEX, USERS_MAPPING), (AUDIT_INDEX, AUDIT_MAPPING)]:
+    for idx, mapping in [(CODE_INDEX, CODE_MAPPING), (CHATS_INDEX, CHATS_MAPPING),
+                         (USERS_INDEX, USERS_MAPPING), (AUDIT_INDEX, AUDIT_MAPPING),
+                         (API_KEYS_INDEX, API_KEYS_MAPPING),
+                         (RESET_TOKENS_INDEX, RESET_TOKENS_MAPPING)]:
         r = requests.get(f"{ES_URL}/{idx}", auth=ES_AUTH, verify=False)
         if r.status_code == 404:
             requests.put(f"{ES_URL}/{idx}", json=mapping,
@@ -312,10 +368,50 @@ import bcrypt
 import jwt as _jwt
 import datetime as _dt
 import time as _time
-from fastapi import Depends, status
+import hmac as _hmac
+import hashlib as _hashlib
+import secrets as _secrets
+from fastapi import Depends, status, Request
 from fastapi.security import OAuth2PasswordBearer
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
+
+
+def _sha256_hex(s: str) -> str:
+    return _hashlib.sha256(s.encode()).hexdigest()
+
+
+def _user_from_api_key(raw_key: str) -> dict | None:
+    """Look up an active API key by sha256 hash; return user dict or None."""
+    h = _sha256_hex(raw_key)
+    r = requests.post(
+        f"{ES_URL}/{API_KEYS_INDEX}/_search",
+        auth=ES_AUTH, verify=False,
+        json={"query": {"bool": {"filter": [
+            {"term": {"key_hash": h}},
+            {"term": {"revoked": False}},
+        ]}}, "size": 1},
+        timeout=5,
+    )
+    if r.status_code != 200:
+        return None
+    hits = r.json().get("hits", {}).get("hits", [])
+    if not hits:
+        return None
+    src = hits[0]["_source"]
+    # Best-effort last_used update; do not block.
+    def _touch():
+        try:
+            requests.post(
+                f"{ES_URL}/{API_KEYS_INDEX}/_update/{hits[0]['_id']}",
+                auth=ES_AUTH, verify=False,
+                json={"doc": {"last_used": int(_time.time() * 1000)}}, timeout=3,
+            )
+        except Exception:
+            pass
+    _threading.Thread(target=_touch, daemon=True).start()
+    return {"email": src.get("owner", "apikey"), "role": src.get("role", "user"),
+            "auth": "apikey", "key_name": src.get("name", "")}
 
 
 def hash_password(pw: str) -> str:
@@ -353,7 +449,15 @@ def get_user_by_email(email: str) -> dict | None:
     return hits[0]["_source"] if hits else None
 
 
-def current_user(token: str | None = Depends(oauth2_scheme)) -> dict:
+def current_user(request: Request, token: str | None = Depends(oauth2_scheme)) -> dict:
+    # Accept either Bearer JWT or "Authorization: ApiKey <key>" header.
+    auth_hdr = request.headers.get("authorization", "")
+    if auth_hdr.lower().startswith("apikey "):
+        raw = auth_hdr.split(" ", 1)[1].strip()
+        u = _user_from_api_key(raw)
+        if u:
+            return u
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid API key")
     if not token:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing token")
     try:
@@ -362,7 +466,7 @@ def current_user(token: str | None = Depends(oauth2_scheme)) -> dict:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token expired")
     except _jwt.PyJWTError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token")
-    return {"email": payload["sub"], "role": payload.get("role", "user")}
+    return {"email": payload["sub"], "role": payload.get("role", "user"), "auth": "jwt"}
 
 
 def require_admin(user: dict = Depends(current_user)) -> dict:
@@ -421,7 +525,151 @@ def auth_register(req: RegisterReq) -> dict:
     )
     if r.status_code not in (200, 201):
         raise HTTPException(500, f"Register failed: {r.text[:200]}")
+    # Best-effort welcome email — silent if SMTP not configured
+    send_email(
+        req.email,
+        "Welcome to GRP Support AI",
+        f"Hi {req.name or req.email},\n\n"
+        f"An admin created an account for you on GRP Support AI.\n\n"
+        f"Sign in here: {FRONTEND_URL}\n"
+        f"Email:    {req.email}\n"
+        f"Password: {req.password}\n\n"
+        f"Please change your password after first sign-in.\n",
+    )
     return {"ok": True, "email": req.email, "role": role}
+
+
+# ── Password reset (token-based, for users who forgot password) ───────────────
+class ResetRequestReq(BaseModel):
+    email: str
+
+
+class ResetConfirmReq(BaseModel):
+    token: str
+    new_password: str
+
+
+@app.post("/auth/reset-request")
+def auth_reset_request(req: ResetRequestReq) -> dict:
+    """Issue a password-reset token for the given email if it exists. Always returns ok
+    to avoid email enumeration."""
+    user = get_user_by_email(req.email)
+    if user:
+        raw = _secrets.token_urlsafe(32)
+        h = _sha256_hex(raw)
+        doc = {
+            "token_hash": h,
+            "email":      req.email,
+            "expires_at": int(_time.time() + 3600),  # 1h TTL
+            "used":       False,
+        }
+        requests.post(
+            f"{ES_URL}/{RESET_TOKENS_INDEX}/_doc?refresh=true",
+            auth=ES_AUTH, verify=False, json=doc, timeout=10,
+        )
+        send_email(
+            req.email,
+            "Reset your GRP Support AI password",
+            f"Hi,\n\n"
+            f"A password reset was requested for your account.\n\n"
+            f"Reset link (valid 1 hour): {FRONTEND_URL}/?reset_token={raw}\n\n"
+            f"If you did not request this, ignore this message.\n",
+        )
+    return {"ok": True}
+
+
+@app.post("/auth/reset-confirm")
+def auth_reset_confirm(req: ResetConfirmReq) -> dict:
+    if len(req.new_password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    h = _sha256_hex(req.token)
+    r = requests.post(
+        f"{ES_URL}/{RESET_TOKENS_INDEX}/_search",
+        auth=ES_AUTH, verify=False,
+        json={"query": {"bool": {"filter": [
+            {"term": {"token_hash": h}}, {"term": {"used": False}},
+        ]}}, "size": 1}, timeout=10,
+    )
+    hits = r.json().get("hits", {}).get("hits", []) if r.status_code == 200 else []
+    if not hits:
+        raise HTTPException(400, "Invalid or expired reset token")
+    src = hits[0]["_source"]
+    if int(src.get("expires_at", 0)) < int(_time.time()):
+        raise HTTPException(400, "Invalid or expired reset token")
+    email = src["email"]
+    if not get_user_by_email(email):
+        raise HTTPException(400, "Account no longer exists")
+    requests.post(
+        f"{ES_URL}/{USERS_INDEX}/_update_by_query?refresh=true",
+        auth=ES_AUTH, verify=False,
+        json={
+            "script": {
+                "source": "ctx._source.password_hash = params.h",
+                "params": {"h": hash_password(req.new_password)},
+            },
+            "query": {"term": {"email": email}},
+        }, timeout=10,
+    )
+    requests.post(
+        f"{ES_URL}/{RESET_TOKENS_INDEX}/_update/{hits[0]['_id']}?refresh=true",
+        auth=ES_AUTH, verify=False, json={"doc": {"used": True}}, timeout=10,
+    )
+    return {"ok": True, "email": email}
+
+
+# ── API keys (service-to-service auth alongside JWT) ──────────────────────────
+class ApiKeyCreateReq(BaseModel):
+    name:  str
+    owner: str  # email; must be an existing user (key inherits user's role)
+
+
+@app.post("/api-keys", dependencies=[Depends(require_admin)])
+def api_key_create(req: ApiKeyCreateReq) -> dict:
+    """Mint a new API key. Returned in the clear ONCE — store immediately."""
+    user = get_user_by_email(req.owner)
+    if not user:
+        raise HTTPException(404, f"Owner user not found: {req.owner}")
+    raw = "grp_" + _secrets.token_urlsafe(32)
+    doc = {
+        "key_hash":   _sha256_hex(raw),
+        "name":       req.name,
+        "owner":      req.owner,
+        "role":       user.get("role", "user"),
+        "created_at": int(_time.time() * 1000),
+        "last_used":  None,
+        "revoked":    False,
+    }
+    r = requests.post(
+        f"{ES_URL}/{API_KEYS_INDEX}/_doc?refresh=wait_for",
+        auth=ES_AUTH, verify=False, json=doc, timeout=10,
+    )
+    if r.status_code not in (200, 201):
+        raise HTTPException(500, f"Create failed: {r.text[:200]}")
+    return {"id": r.json().get("_id"), "key": raw, "name": req.name, "owner": req.owner}
+
+
+@app.get("/api-keys", dependencies=[Depends(require_admin)])
+def api_key_list() -> list[dict]:
+    r = requests.post(
+        f"{ES_URL}/{API_KEYS_INDEX}/_search",
+        auth=ES_AUTH, verify=False,
+        json={"size": 200, "_source": ["name", "owner", "role", "created_at",
+                                        "last_used", "revoked"],
+              "sort": [{"created_at": {"order": "desc"}}]}, timeout=10,
+    )
+    hits = r.json().get("hits", {}).get("hits", []) if r.status_code == 200 else []
+    return [{"id": h["_id"], **h["_source"]} for h in hits]
+
+
+@app.delete("/api-keys/{key_id}", dependencies=[Depends(require_admin)])
+def api_key_revoke(key_id: str) -> dict:
+    r = requests.post(
+        f"{ES_URL}/{API_KEYS_INDEX}/_update/{key_id}?refresh=true",
+        auth=ES_AUTH, verify=False, json={"doc": {"revoked": True}}, timeout=10,
+    )
+    if r.status_code == 404:
+        raise HTTPException(404, "Key not found")
+    return {"ok": True, "id": key_id}
 
 
 class ChangePasswordReq(BaseModel):
@@ -605,6 +853,276 @@ def check_rate_limit(user_email: str) -> None:
                 headers={"Retry-After": str(retry_in)},
             )
         dq.append(now)
+
+
+# ── Image signing (HMAC-signed URLs) ──────────────────────────────────────────
+from fastapi.responses import FileResponse
+
+
+def _sign_image(path: str, ttl: int | None = None) -> str:
+    """Return a full signed image URL for a manual-image relative path."""
+    ttl = IMG_SIGN_TTL if ttl is None else ttl
+    exp = int(_time.time()) + max(60, ttl)
+    msg = f"{path}|{exp}".encode()
+    sig = _hmac.new(JWT_SECRET.encode(), msg, _hashlib.sha256).hexdigest()[:32]
+    encoded = _url_quote(path, safe="/")
+    return f"{IMG_PUBLIC_BASE}/{encoded}?sig={sig}&exp={exp}"
+
+
+def _verify_image_sig(path: str, sig: str, exp: int) -> bool:
+    if exp < int(_time.time()):
+        return False
+    msg = f"{path}|{exp}".encode()
+    expected = _hmac.new(JWT_SECRET.encode(), msg, _hashlib.sha256).hexdigest()[:32]
+    return _hmac.compare_digest(sig, expected)
+
+
+# Match any URL pointing at the configured legacy IMG_BASE so we can rewrite it
+# to a signed equivalent at response time. URLs already inside answer text were
+# baked in at ingest time — this is the migration path without re-embedding.
+_IMG_URL_RE = re.compile(
+    rf'(?P<base>{re.escape(IMG_BASE)}|{re.escape(IMG_PUBLIC_BASE)})/(?P<path>[^\s\)\"\']+)',
+    re.IGNORECASE,
+)
+
+
+def _sign_text_images(text: str) -> str:
+    """Rewrite every image URL in the text to a signed URL."""
+    if not text:
+        return text
+    from urllib.parse import unquote
+
+    def _rep(m: re.Match) -> str:
+        raw_path = m.group("path").split("?", 1)[0]
+        path = unquote(raw_path)
+        return _sign_image(path)
+
+    return _IMG_URL_RE.sub(_rep, text)
+
+
+def _sign_image_dicts(items: list[dict]) -> list[dict]:
+    """Rewrite the `url` field of each image dict to a signed URL."""
+    out = []
+    for it in items:
+        url = it.get("url", "")
+        m = _IMG_URL_RE.match(url)
+        if m:
+            from urllib.parse import unquote
+            it = {**it, "url": _sign_image(unquote(m.group("path").split("?", 1)[0]))}
+        out.append(it)
+    return out
+
+
+@app.get("/images/{path:path}")
+def get_image(path: str, sig: str = "", exp: int = 0):
+    """Serve a manual image only if the HMAC signature is valid and unexpired."""
+    if not _verify_image_sig(path, sig, exp):
+        raise HTTPException(status_code=403, detail="Invalid or expired image signature")
+    img_dir_abs = os.path.abspath(IMG_DIR)
+    full = os.path.abspath(os.path.join(IMG_DIR, path))
+    if not (full == img_dir_abs or full.startswith(img_dir_abs + os.sep)):
+        raise HTTPException(status_code=400, detail="Bad path")
+    if not os.path.isfile(full):
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(full)
+
+
+# ── External alerting (Slack-compatible webhook) ──────────────────────────────
+def notify_slack(text: str, **fields) -> None:
+    """Fire-and-forget post to SLACK_WEBHOOK_URL. No-op if not configured."""
+    if not SLACK_WEBHOOK_URL:
+        return
+    payload = {"text": text}
+    if fields:
+        payload["text"] = text + "\n" + "\n".join(f"• *{k}*: {v}" for k, v in fields.items())
+
+    def _send():
+        try:
+            requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
+        except Exception as e:
+            log_kv("warning", "slack-notify-failed", err=str(e))
+    _threading.Thread(target=_send, daemon=True).start()
+
+
+# ── Cost / token budget ───────────────────────────────────────────────────────
+def estimate_cost_usd(input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
+    """USD cost estimate from token counts at configured per-million rates."""
+    billed_input = max(0, (input_tokens or 0) - (cached_tokens or 0))
+    return round(
+        (billed_input  * COST_INPUT_PER_M  / 1_000_000) +
+        ((output_tokens or 0) * COST_OUTPUT_PER_M / 1_000_000) +
+        ((cached_tokens or 0) * COST_CACHE_PER_M  / 1_000_000),
+        4,
+    )
+
+
+def _month_range_iso() -> tuple[str, str]:
+    now = _dt.datetime.now(_dt.timezone.utc)
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = start + _dt.timedelta(days=32)
+    end = end.replace(day=1)
+    return start.isoformat(), end.isoformat()
+
+
+def _audit_token_sum(user: str | None = None) -> dict:
+    """Aggregate input/output/cached tokens for the current calendar month."""
+    start, end = _month_range_iso()
+    must = [{"range": {"ts": {"gte": start, "lt": end}}}, {"term": {"event": "query"}}]
+    if user:
+        must.append({"term": {"user": user}})
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": must}},
+        "aggs": {
+            "input":  {"sum": {"field": "input_tokens"}},
+            "output": {"sum": {"field": "output_tokens"}},
+            "cached": {"sum": {"field": "cached_tokens"}},
+            "calls":  {"value_count": {"field": "user"}},
+        },
+    }
+    r = requests.post(f"{ES_URL}/{AUDIT_INDEX}/_search",
+                      auth=ES_AUTH, verify=False, json=body, timeout=10)
+    if r.status_code != 200:
+        return {"input": 0, "output": 0, "cached": 0, "calls": 0}
+    aggs = r.json().get("aggregations", {})
+    return {
+        "input":  int(aggs.get("input",  {}).get("value") or 0),
+        "output": int(aggs.get("output", {}).get("value") or 0),
+        "cached": int(aggs.get("cached", {}).get("value") or 0),
+        "calls":  int(aggs.get("calls",  {}).get("value") or 0),
+    }
+
+
+def check_token_budget() -> None:
+    """Raise 429 if MONTHLY_TOKEN_BUDGET is configured and already exhausted."""
+    if MONTHLY_TOKEN_BUDGET <= 0:
+        return
+    s = _audit_token_sum()
+    spent = s["input"] + s["output"]
+    if spent >= MONTHLY_TOKEN_BUDGET:
+        notify_slack(
+            f":octagonal_sign: GRP-Support monthly token budget exhausted",
+            spent=spent, budget=MONTHLY_TOKEN_BUDGET,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=f"Monthly token budget exhausted ({spent:,}/{MONTHLY_TOKEN_BUDGET:,}). "
+                   f"Try again next month or contact your admin.",
+        )
+
+
+@app.get("/audit/usage", dependencies=[Depends(require_admin)])
+def audit_usage(user: str | None = None) -> dict:
+    """Per-user month-to-date token usage and estimated cost."""
+    start, end = _month_range_iso()
+    must = [{"range": {"ts": {"gte": start, "lt": end}}}, {"term": {"event": "query"}}]
+    if user:
+        must.append({"term": {"user": user}})
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": must}},
+        "aggs": {
+            "by_user": {
+                "terms": {"field": "user", "size": 200},
+                "aggs": {
+                    "input":  {"sum": {"field": "input_tokens"}},
+                    "output": {"sum": {"field": "output_tokens"}},
+                    "cached": {"sum": {"field": "cached_tokens"}},
+                },
+            },
+            "input":  {"sum": {"field": "input_tokens"}},
+            "output": {"sum": {"field": "output_tokens"}},
+            "cached": {"sum": {"field": "cached_tokens"}},
+        },
+    }
+    r = requests.post(f"{ES_URL}/{AUDIT_INDEX}/_search",
+                      auth=ES_AUTH, verify=False, json=body, timeout=15)
+    if r.status_code != 200:
+        raise HTTPException(500, f"ES query failed: {r.text[:200]}")
+    aggs = r.json().get("aggregations", {})
+    rows = []
+    for b in aggs.get("by_user", {}).get("buckets", []):
+        i = int(b.get("input",  {}).get("value") or 0)
+        o = int(b.get("output", {}).get("value") or 0)
+        c = int(b.get("cached", {}).get("value") or 0)
+        rows.append({
+            "user":   b["key"],
+            "calls":  b["doc_count"],
+            "input_tokens":  i,
+            "output_tokens": o,
+            "cached_tokens": c,
+            "cost_usd":      estimate_cost_usd(i, o, c),
+        })
+    rows.sort(key=lambda x: x["cost_usd"], reverse=True)
+    tot_i = int(aggs.get("input",  {}).get("value") or 0)
+    tot_o = int(aggs.get("output", {}).get("value") or 0)
+    tot_c = int(aggs.get("cached", {}).get("value") or 0)
+    return {
+        "month_start": start,
+        "month_end":   end,
+        "users":       rows,
+        "total": {
+            "input_tokens":  tot_i,
+            "output_tokens": tot_o,
+            "cached_tokens": tot_c,
+            "cost_usd":      estimate_cost_usd(tot_i, tot_o, tot_c),
+            "budget":        MONTHLY_TOKEN_BUDGET,
+            "budget_pct":    round(((tot_i + tot_o) / MONTHLY_TOKEN_BUDGET) * 100, 1)
+                              if MONTHLY_TOKEN_BUDGET > 0 else None,
+        },
+    }
+
+
+# ── Index retention (audit / chats) ───────────────────────────────────────────
+@app.post("/admin/retention/run", dependencies=[Depends(require_admin)])
+def retention_run(audit_days: int = 90, chats_days: int = 365) -> dict:
+    """Delete old audit / chat docs. Idempotent. Schedule via cron in production."""
+    cutoff_audit = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=max(1, audit_days))).isoformat()
+    cutoff_chats_ms = int((_time.time() - max(1, chats_days) * 86400) * 1000)
+    out = {}
+    r = requests.post(
+        f"{ES_URL}/{AUDIT_INDEX}/_delete_by_query?conflicts=proceed",
+        auth=ES_AUTH, verify=False, timeout=60,
+        json={"query": {"range": {"ts": {"lt": cutoff_audit}}}},
+    )
+    out["audit"] = {"status": r.status_code, "deleted": r.json().get("deleted", 0) if r.status_code == 200 else 0}
+    r = requests.post(
+        f"{ES_URL}/{CHATS_INDEX}/_delete_by_query?conflicts=proceed",
+        auth=ES_AUTH, verify=False, timeout=60,
+        json={"query": {"range": {"updated_at": {"lt": cutoff_chats_ms}}}},
+    )
+    out["chats"] = {"status": r.status_code, "deleted": r.json().get("deleted", 0) if r.status_code == 200 else 0}
+    log_kv("info", "retention-run", **out)
+    return out
+
+
+# ── SMTP / email ──────────────────────────────────────────────────────────────
+def send_email(to: str, subject: str, body: str) -> bool:
+    """Send a plain-text email. No-op + warning if SMTP_HOST is empty."""
+    if not SMTP_HOST:
+        log_kv("warning", "smtp-not-configured", to=to, subject=subject)
+        return False
+    import smtplib
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["From"] = SMTP_FROM
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    def _send():
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                if SMTP_USE_TLS:
+                    s.starttls()
+                if SMTP_USER:
+                    s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(msg)
+            log_kv("info", "email-sent", to=to, subject=subject)
+        except Exception as e:
+            log_kv("warning", "email-send-failed", to=to, err=str(e))
+    _threading.Thread(target=_send, daemon=True).start()
+    return True
 
 
 # ── Models ─────────────────────────────────────────────────────────────────────
@@ -1219,7 +1737,7 @@ def fetch_images_for_sections(manuals: list[dict]) -> list[dict]:
                     seen.add(fname)
                     img_path = fname.replace("Doc-Images/", "", 1)
                     images.append({
-                        "url":     f"{IMG_BASE}/{img_path}",
+                        "url":     _sign_image(img_path),
                         "module":  src.get("module", module),
                         "section": src.get("section", section),
                         "caption": cap_list[i] if i < len(cap_list) else "",
@@ -1269,6 +1787,7 @@ def query(req: QueryRequest, user: dict = Depends(current_user)):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Empty question")
     check_rate_limit(user["email"])
+    check_token_budget()
 
     t0 = _time.time()
     try:
@@ -1308,6 +1827,7 @@ def query(req: QueryRequest, user: dict = Depends(current_user)):
         )
 
     answer, sources_dict = parse_sources_block(raw_answer)
+    answer = _sign_text_images(answer)
     images  = fetch_images_for_sections(sources_dict.get("manuals", [])) if req.include_images else []
     sources = build_sources_from_dict(sources_dict)
 
@@ -1402,9 +1922,11 @@ def _stream_claude_agent(user_email: str, req: QueryRequest):
             # end_turn — emit done with parsed sources from accumulated text
             full = "".join(final_text_parts)
             answer, sources_dict = parse_sources_block(full)
+            answer = _sign_text_images(answer)
             images  = fetch_images_for_sections(sources_dict.get("manuals", [])) if req.include_images else []
             sources = build_sources_from_dict(sources_dict)
             yield _sse("done", {
+                "answer":       answer,
                 "answer_chars": len(answer),
                 "sources":      [s.dict() if hasattr(s, "dict") else s for s in sources],
                 "images":       images,
@@ -1443,6 +1965,7 @@ def query_stream(req: QueryRequest, user: dict = Depends(current_user)):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Empty question")
     check_rate_limit(user["email"])
+    check_token_budget()
     return StreamingResponse(_stream_claude_agent(user["email"], req),
                              media_type="text/event-stream")
 
@@ -1487,7 +2010,7 @@ def get_section_images(module: str = Query(...), section: str = Query(...)) -> d
         img_path = fname.replace("Doc-Images/", "", 1)
         images.append({
             "filename": fname,
-            "url": f"{IMG_BASE}/{img_path}",
+            "url": _sign_image(img_path),
             "caption": cap_list[i] if i < len(cap_list) else ""
         })
     return {"doc_id": doc_id, "images": images}
@@ -1573,8 +2096,7 @@ async def upload_image(
     if r.status_code not in (200, 201):
         raise HTTPException(500, f"ES update failed: {r.text[:200]}")
 
-    img_url = f"{IMG_BASE}/{filename}"
-    return {"status": "ok", "filename": filename, "url": img_url}
+    return {"status": "ok", "filename": filename, "url": _sign_image(filename)}
 
 
 @app.delete("/delete-image", dependencies=[Depends(require_admin)])
@@ -1826,7 +2348,7 @@ async def upload_image_bulk(
             }
             requests.post(f"{ES_URL}/grp-manuals/_update/{doc_id}",
                           auth=ES_AUTH, verify=False, json=script, timeout=10)
-            uploaded.append({"filename": filename, "url": f"{IMG_BASE}/{filename}", "caption": caption})
+            uploaded.append({"filename": filename, "url": _sign_image(filename), "caption": caption})
         except Exception as e:
             errors.append(f"{file.filename}: {e}")
 
