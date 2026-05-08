@@ -9,6 +9,9 @@ fastapi
 uvicorn
 pydantic
 python-multipart
+anthropic
+bcrypt
+PyJWT
 
 # Loaders (load_manuals.py, load_rfs_embed.py)
 xlrd
