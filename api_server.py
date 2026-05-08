@@ -45,6 +45,10 @@ SCRIPTS_INDEX = "grp-scripts"
 CODE_INDEX    = "grp-code"
 CHATS_INDEX   = "grp-chats"
 USERS_INDEX   = "grp-users"
+AUDIT_INDEX   = "grp-audit"
+
+# Per-user query rate limit (soft cap; in-memory per worker, so effective cap = N_WORKERS x this)
+QUERY_RATE_LIMIT_PER_MIN = int(os.environ.get("QUERY_RATE_LIMIT_PER_MIN", "30"))
 
 MONTH_INDEX_MAP = {
     1: "rfs-tickets-jan-2025", 2: "rfs-tickets-feb-2025",
@@ -94,6 +98,27 @@ USERS_MAPPING = {
             "name":          {"type": "text"},
             "role":          {"type": "keyword"},
             "created_at":    {"type": "long"},
+        }
+    }
+}
+
+AUDIT_MAPPING = {
+    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {
+        "properties": {
+            "ts":             {"type": "date"},
+            "user":           {"type": "keyword"},
+            "event":          {"type": "keyword"},
+            "question":       {"type": "text"},
+            "model":          {"type": "keyword"},
+            "latency_ms":     {"type": "long"},
+            "tool_calls":     {"type": "integer"},
+            "input_tokens":   {"type": "long"},
+            "output_tokens":  {"type": "long"},
+            "cached_tokens":  {"type": "long"},
+            "answer_chars":   {"type": "long"},
+            "status":         {"type": "keyword"},
+            "error":          {"type": "text"},
         }
     }
 }
@@ -274,12 +299,12 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     """Ensure auxiliary indices exist on startup."""
-    for idx, mapping in [(CODE_INDEX, CODE_MAPPING), (CHATS_INDEX, CHATS_MAPPING), (USERS_INDEX, USERS_MAPPING)]:
+    for idx, mapping in [(CODE_INDEX, CODE_MAPPING), (CHATS_INDEX, CHATS_MAPPING), (USERS_INDEX, USERS_MAPPING), (AUDIT_INDEX, AUDIT_MAPPING)]:
         r = requests.get(f"{ES_URL}/{idx}", auth=ES_AUTH, verify=False)
         if r.status_code == 404:
             requests.put(f"{ES_URL}/{idx}", json=mapping,
                          auth=ES_AUTH, verify=False)
-            print(f"Created index: {idx}")
+            log_kv("info", "index-created", index=idx)
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
@@ -439,6 +464,145 @@ def auth_users() -> list[dict]:
     )
     hits = r.json().get("hits", {}).get("hits", []) if r.status_code == 200 else []
     return [h["_source"] for h in hits]
+
+
+class ResetPasswordReq(BaseModel):
+    new_password: str
+
+
+@app.delete("/auth/users/{email}")
+def auth_delete_user(email: str, admin: dict = Depends(require_admin)) -> dict:
+    if email == admin["email"]:
+        raise HTTPException(400, "Cannot delete yourself")
+    if not get_user_by_email(email):
+        raise HTTPException(404, "User not found")
+    r = requests.post(
+        f"{ES_URL}/{USERS_INDEX}/_delete_by_query?refresh=true",
+        auth=ES_AUTH, verify=False,
+        json={"query": {"term": {"email": email}}},
+        timeout=10,
+    )
+    if r.status_code != 200:
+        raise HTTPException(500, f"Delete failed: {r.text[:200]}")
+    return {"ok": True, "deleted": r.json().get("deleted", 0)}
+
+
+@app.post("/auth/users/{email}/reset-password", dependencies=[Depends(require_admin)])
+def auth_reset_password(email: str, req: ResetPasswordReq) -> dict:
+    if not get_user_by_email(email):
+        raise HTTPException(404, "User not found")
+    if len(req.new_password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    r = requests.post(
+        f"{ES_URL}/{USERS_INDEX}/_update_by_query?refresh=true",
+        auth=ES_AUTH, verify=False,
+        json={
+            "script": {
+                "source": "ctx._source.password_hash = params.h",
+                "params": {"h": hash_password(req.new_password)},
+            },
+            "query": {"term": {"email": email}},
+        },
+        timeout=10,
+    )
+    if r.status_code != 200:
+        raise HTTPException(500, f"Reset failed: {r.text[:200]}")
+    return {"ok": True, "email": email}
+
+
+# ── Structured logging ────────────────────────────────────────────────────────
+import logging as _logging
+import sys as _sys
+import threading as _threading
+from collections import deque as _deque
+
+
+class _JsonFormatter(_logging.Formatter):
+    def format(self, record: _logging.LogRecord) -> str:
+        payload = {
+            "ts":     _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "level":  record.levelname,
+            "logger": record.name,
+            "msg":    record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        for k, v in getattr(record, "extra_fields", {}).items():
+            payload[k] = v
+        return json.dumps(payload, default=str)
+
+
+_root_logger = _logging.getLogger()
+if not any(isinstance(h, _logging.StreamHandler) and isinstance(h.formatter, _JsonFormatter)
+           for h in _root_logger.handlers):
+    _h = _logging.StreamHandler(_sys.stdout)
+    _h.setFormatter(_JsonFormatter())
+    _root_logger.addHandler(_h)
+    _root_logger.setLevel(_logging.INFO)
+
+log = _logging.getLogger("grp-api")
+
+
+def log_kv(level: str, msg: str, **kv) -> None:
+    rec = log.makeRecord(log.name, getattr(_logging, level.upper()), "", 0, msg, (), None)
+    rec.extra_fields = kv
+    log.handle(rec)
+
+
+# ── Audit log ─────────────────────────────────────────────────────────────────
+def write_audit(user_email: str, event: str, **fields) -> None:
+    """Best-effort fire-and-forget audit write; failures only log, never raise."""
+    doc = {
+        "ts":    _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "user":  user_email,
+        "event": event,
+        **{k: v for k, v in fields.items() if v is not None},
+    }
+    try:
+        requests.post(
+            f"{ES_URL}/{AUDIT_INDEX}/_doc",
+            auth=ES_AUTH, verify=False, json=doc, timeout=3,
+        )
+    except Exception as e:
+        log_kv("warning", "audit-write-failed", err=str(e))
+
+
+@app.get("/audit", dependencies=[Depends(require_admin)])
+def audit_recent(user: str | None = None, size: int = 100) -> list[dict]:
+    body: dict = {
+        "size": min(max(size, 1), 500),
+        "sort": [{"ts": {"order": "desc"}}],
+    }
+    if user:
+        body["query"] = {"term": {"user": user}}
+    r = requests.post(f"{ES_URL}/{AUDIT_INDEX}/_search",
+                      auth=ES_AUTH, verify=False, json=body, timeout=10)
+    if r.status_code != 200:
+        return []
+    return [h["_source"] for h in r.json().get("hits", {}).get("hits", [])]
+
+
+# ── Per-user rate limit (in-memory per worker; cap = N_WORKERS * limit) ──────
+_rate_lock = _threading.Lock()
+_rate_log: dict[str, "_deque[float]"] = {}
+
+
+def check_rate_limit(user_email: str) -> None:
+    """Raise 429 if user exceeded QUERY_RATE_LIMIT_PER_MIN queries in the last 60s."""
+    now = _time.time()
+    cutoff = now - 60.0
+    with _rate_lock:
+        dq = _rate_log.setdefault(user_email, _deque())
+        while dq and dq[0] < cutoff:
+            dq.popleft()
+        if len(dq) >= QUERY_RATE_LIMIT_PER_MIN:
+            retry_in = max(1, int(60 - (now - dq[0])))
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded ({QUERY_RATE_LIMIT_PER_MIN}/min). Retry in {retry_in}s.",
+                headers={"Retry-After": str(retry_in)},
+            )
+        dq.append(now)
 
 
 # ── Models ─────────────────────────────────────────────────────────────────────
@@ -924,24 +1088,20 @@ def _read_attached_file_text(path: str, max_bytes: int = 200_000) -> str:
         return f"[failed to read {path}: {e}]"
 
 
-def call_claude_agent(question: str, seed_context: str,
-                      history: list = None,
-                      attached_files: list = None) -> str:
+def _build_user_text(question: str, seed_context: str,
+                     history: list = None, attached_files: list = None) -> str:
     history_text = format_history(history or [])
     safe_files = [p for p in (attached_files or [])
                   if isinstance(p, str) and p.startswith(CHAT_UPLOAD_DIR + "/") and os.path.exists(p)]
     files_block = ""
     if safe_files:
-        chunks = []
-        for p in safe_files:
-            chunks.append(f"--- FILE: {os.path.basename(p)} ---\n"
-                          + _read_attached_file_text(p))
+        chunks = [f"--- FILE: {os.path.basename(p)} ---\n" + _read_attached_file_text(p)
+                  for p in safe_files]
         files_block = (
             "USER ATTACHED FILES — content embedded below; cite alongside knowledge-base sources:\n\n"
             + "\n\n".join(chunks) + "\n\n"
         )
-
-    user_text = (
+    return (
         f"{history_text}"
         f"{files_block}"
         f"INITIAL CONTEXT (kNN semantic seed — treat as incomplete starting point):\n"
@@ -950,7 +1110,23 @@ def call_claude_agent(question: str, seed_context: str,
         f"Now search Elasticsearch via the available tools, then answer."
     )
 
+
+def _block_to_dict(b) -> dict:
+    if b.type == "text":
+        return {"type": "text", "text": b.text}
+    if b.type == "tool_use":
+        return {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
+    return {"type": b.type}
+
+
+def call_claude_agent(question: str, seed_context: str,
+                      history: list = None,
+                      attached_files: list = None) -> dict:
+    """Run the agent loop. Returns {text, tool_calls, input_tokens, output_tokens, cached_tokens}."""
+    user_text = _build_user_text(question, seed_context, history, attached_files)
     messages: list = [{"role": "user", "content": user_text}]
+    tool_calls = 0
+    tot_in = tot_out = tot_cached = 0
 
     try:
         for _step in range(_MAX_TOOL_ITERS):
@@ -965,11 +1141,18 @@ def call_claude_agent(question: str, seed_context: str,
                 tools=ES_TOOLS,
                 messages=messages,
             )
+            usage = getattr(resp, "usage", None)
+            if usage:
+                tot_in     += getattr(usage, "input_tokens", 0) or 0
+                tot_out    += getattr(usage, "output_tokens", 0) or 0
+                tot_cached += getattr(usage, "cache_read_input_tokens", 0) or 0
             if resp.stop_reason == "tool_use":
-                messages.append({"role": "assistant", "content": resp.content})
+                messages.append({"role": "assistant",
+                                 "content": [_block_to_dict(b) for b in resp.content]})
                 tool_results = []
                 for block in resp.content:
                     if block.type == "tool_use":
+                        tool_calls += 1
                         out = _run_tool(block.name, block.input or {})
                         tool_results.append({
                             "type":        "tool_result",
@@ -978,10 +1161,21 @@ def call_claude_agent(question: str, seed_context: str,
                         })
                 messages.append({"role": "user", "content": tool_results})
                 continue
-            # end_turn / stop_sequence / max_tokens — assemble final text
             text = "".join(b.text for b in resp.content if b.type == "text")
-            return text or "No response from Claude."
-        return "Tool loop exceeded max iterations — partial answer unavailable."
+            return {
+                "text":           text or "No response from Claude.",
+                "tool_calls":     tool_calls,
+                "input_tokens":   tot_in,
+                "output_tokens":  tot_out,
+                "cached_tokens":  tot_cached,
+            }
+        return {
+            "text":           "Tool loop exceeded max iterations — partial answer unavailable.",
+            "tool_calls":     tool_calls,
+            "input_tokens":   tot_in,
+            "output_tokens":  tot_out,
+            "cached_tokens":  tot_cached,
+        }
     except anthropic.APIStatusError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {e.message}")
     except anthropic.APITimeoutError:
@@ -1068,21 +1262,43 @@ def list_indices():
     return result
 
 
-@app.post("/query", response_model=QueryResponse, dependencies=[Depends(current_user)])
-def query(req: QueryRequest):
+@app.post("/query", response_model=QueryResponse)
+def query(req: QueryRequest, user: dict = Depends(current_user)):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Empty question")
+    check_rate_limit(user["email"])
 
+    t0 = _time.time()
     try:
         embedding = get_embedding(req.question)
     except Exception as e:
+        write_audit(user["email"], "query",
+                    question=req.question[:1000], status="error",
+                    error=f"embedding: {e}", latency_ms=int((_time.time()-t0)*1000))
         raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
 
     seed_context, seed_count = get_seed_context(embedding)
-    raw_answer = call_claude_agent(req.question, seed_context, req.history, req.attached_files)
+    try:
+        result = call_claude_agent(req.question, seed_context, req.history, req.attached_files)
+    except HTTPException as he:
+        write_audit(user["email"], "query",
+                    question=req.question[:1000], model=ANTHROPIC_MODEL,
+                    status="error", error=he.detail,
+                    latency_ms=int((_time.time()-t0)*1000))
+        raise
 
+    raw_answer = result["text"]
     clarify_match = re.match(r'^CLARIFY:\s*(.+)', raw_answer.strip(), re.DOTALL)
     if clarify_match:
+        write_audit(user["email"], "query",
+                    question=req.question[:1000], model=ANTHROPIC_MODEL,
+                    status="clarify",
+                    tool_calls=result["tool_calls"],
+                    input_tokens=result["input_tokens"],
+                    output_tokens=result["output_tokens"],
+                    cached_tokens=result["cached_tokens"],
+                    answer_chars=len(raw_answer),
+                    latency_ms=int((_time.time()-t0)*1000))
         return QueryResponse(
             answer=clarify_match.group(1).strip(),
             images=[], sources=[], context_used=0,
@@ -1093,10 +1309,140 @@ def query(req: QueryRequest):
     images  = fetch_images_for_sections(sources_dict.get("manuals", [])) if req.include_images else []
     sources = build_sources_from_dict(sources_dict)
 
+    write_audit(user["email"], "query",
+                question=req.question[:1000], model=ANTHROPIC_MODEL,
+                status="ok",
+                tool_calls=result["tool_calls"],
+                input_tokens=result["input_tokens"],
+                output_tokens=result["output_tokens"],
+                cached_tokens=result["cached_tokens"],
+                answer_chars=len(answer),
+                latency_ms=int((_time.time()-t0)*1000))
+
     return QueryResponse(
         answer=answer, images=images, sources=sources,
         context_used=seed_count, expanded_query=None
     )
+
+
+# ── Streaming /query ──────────────────────────────────────────────────────────
+from fastapi.responses import StreamingResponse
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+def _stream_claude_agent(user_email: str, req: QueryRequest):
+    """Generator yielding SSE strings. Streams text deltas as Claude generates."""
+    t0 = _time.time()
+    try:
+        embedding = get_embedding(req.question)
+    except Exception as e:
+        yield _sse("error", {"detail": f"Embedding failed: {e}"})
+        write_audit(user_email, "query.stream",
+                    question=req.question[:1000], status="error",
+                    error=f"embedding: {e}",
+                    latency_ms=int((_time.time()-t0)*1000))
+        return
+
+    seed_context, _seed_count = get_seed_context(embedding)
+    user_text = _build_user_text(req.question, seed_context, req.history, req.attached_files)
+    messages: list = [{"role": "user", "content": user_text}]
+    tool_calls = 0
+    tot_in = tot_out = tot_cached = 0
+    final_text_parts: list[str] = []
+
+    try:
+        for _step in range(_MAX_TOOL_ITERS):
+            with _anthropic.messages.stream(
+                model=ANTHROPIC_MODEL,
+                max_tokens=8000,
+                system=[{
+                    "type": "text",
+                    "text": AGENT_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                tools=ES_TOOLS,
+                messages=messages,
+            ) as stream:
+                for event in stream:
+                    if event.type == "content_block_delta" and event.delta.type == "text_delta":
+                        final_text_parts.append(event.delta.text)
+                        yield _sse("delta", {"text": event.delta.text})
+                final = stream.get_final_message()
+
+            usage = getattr(final, "usage", None)
+            if usage:
+                tot_in     += getattr(usage, "input_tokens", 0) or 0
+                tot_out    += getattr(usage, "output_tokens", 0) or 0
+                tot_cached += getattr(usage, "cache_read_input_tokens", 0) or 0
+
+            if final.stop_reason == "tool_use":
+                messages.append({"role": "assistant",
+                                 "content": [_block_to_dict(b) for b in final.content]})
+                tool_results = []
+                for block in final.content:
+                    if block.type == "tool_use":
+                        tool_calls += 1
+                        yield _sse("tool", {"name": block.name, "input": block.input})
+                        out = _run_tool(block.name, block.input or {})
+                        tool_results.append({
+                            "type":        "tool_result",
+                            "tool_use_id": block.id,
+                            "content":     out,
+                        })
+                messages.append({"role": "user", "content": tool_results})
+                # Reset text parts at each iteration; only the final one matters for sources
+                final_text_parts = []
+                continue
+
+            # end_turn — emit done with parsed sources from accumulated text
+            full = "".join(final_text_parts)
+            answer, sources_dict = parse_sources_block(full)
+            images  = fetch_images_for_sections(sources_dict.get("manuals", [])) if req.include_images else []
+            sources = build_sources_from_dict(sources_dict)
+            yield _sse("done", {
+                "answer_chars": len(answer),
+                "sources":      [s.dict() if hasattr(s, "dict") else s for s in sources],
+                "images":       images,
+                "tool_calls":   tool_calls,
+            })
+            write_audit(user_email, "query.stream",
+                        question=req.question[:1000], model=ANTHROPIC_MODEL,
+                        status="ok", tool_calls=tool_calls,
+                        input_tokens=tot_in, output_tokens=tot_out,
+                        cached_tokens=tot_cached, answer_chars=len(answer),
+                        latency_ms=int((_time.time()-t0)*1000))
+            return
+
+        yield _sse("error", {"detail": "tool loop exceeded"})
+        write_audit(user_email, "query.stream",
+                    question=req.question[:1000], model=ANTHROPIC_MODEL,
+                    status="error", error="tool-loop-exceeded",
+                    tool_calls=tool_calls,
+                    latency_ms=int((_time.time()-t0)*1000))
+    except anthropic.APIStatusError as e:
+        yield _sse("error", {"detail": e.message})
+        write_audit(user_email, "query.stream",
+                    question=req.question[:1000], model=ANTHROPIC_MODEL,
+                    status="error", error=str(e.message),
+                    latency_ms=int((_time.time()-t0)*1000))
+    except Exception as e:
+        yield _sse("error", {"detail": str(e)})
+        write_audit(user_email, "query.stream",
+                    question=req.question[:1000], model=ANTHROPIC_MODEL,
+                    status="error", error=str(e),
+                    latency_ms=int((_time.time()-t0)*1000))
+
+
+@app.post("/query/stream")
+def query_stream(req: QueryRequest, user: dict = Depends(current_user)):
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Empty question")
+    check_rate_limit(user["email"])
+    return StreamingResponse(_stream_claude_agent(user["email"], req),
+                             media_type="text/event-stream")
 
 
 # ── Routes: Module / Section lookup ────────────────────────────────────────────
