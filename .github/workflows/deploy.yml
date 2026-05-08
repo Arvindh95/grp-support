@@ -45,7 +45,7 @@ jobs:
               cd /opt/grp-chat
             fi
 
-            sudo systemctl restart grp-api grp-chat
+            sudo systemctl restart grp-api
             sleep 3
             curl -fsS http://127.0.0.1:8000/health
-            curl -fsS -o /dev/null http://127.0.0.1:8083/login/
+            curl -fsS -o /dev/null http://127.0.0.1:8081/login/

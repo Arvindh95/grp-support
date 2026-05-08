@@ -574,7 +574,7 @@ def auth_reset_request(req: ResetRequestReq) -> dict:
             "Reset your GRP Support AI password",
             f"Hi,\n\n"
             f"A password reset was requested for your account.\n\n"
-            f"Reset link (valid 1 hour): {FRONTEND_URL}/?reset_token={raw}\n\n"
+            f"Reset link (valid 1 hour): {FRONTEND_URL}/reset-password/?token={raw}\n\n"
             f"If you did not request this, ignore this message.\n",
         )
     return {"ok": True}
