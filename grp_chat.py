@@ -325,9 +325,13 @@ with st.sidebar:
 
     st.divider()
 
+    _is_admin = (st.session_state.get("user", {}) or {}).get("role") == "admin"
+    _pages = ["💬 Chat", "🖼 Image Manager", "📤 Upload Documents"]
+    if _is_admin:
+        _pages.append("👥 Users")
     page = st.radio(
         "Section",
-        ["💬 Chat", "🖼 Image Manager", "📤 Upload Documents"],
+        _pages,
         label_visibility="collapsed",
     )
     st.divider()
@@ -1164,3 +1168,135 @@ elif page == "📤 Upload Documents":
                     st.error(f"Error: {resp.json().get('detail', resp.text[:100])}")
             except Exception as e:
                 st.error(f"Error: {e}")
+
+
+# ── Users (admin only) ────────────────────────────────────────────────────────
+elif page == "👥 Users":
+    if not _is_admin:
+        st.error("Admin only.")
+        st.stop()
+
+    st.title("👥 Users")
+    st.caption("Create accounts, reset passwords, and remove users.")
+
+    # ── Create user ──────────────────────────────────────────────────────────
+    st.subheader("➕ Create user")
+    with st.form("create_user_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            new_email = st.text_input("Email", key="cu_email")
+            new_name  = st.text_input("Name (optional)", key="cu_name")
+        with c2:
+            new_pw    = st.text_input("Initial password (≥8 chars)", type="password", key="cu_pw")
+            new_role  = st.selectbox("Role", ["user", "admin"], key="cu_role")
+        submitted = st.form_submit_button("Create user", type="primary")
+    if submitted:
+        if not new_email.strip() or len(new_pw) < 8:
+            st.error("Email + password (≥8 chars) required.")
+        else:
+            try:
+                r = requests.post(
+                    f"{API_URL}/auth/register",
+                    json={"email": new_email.strip(), "password": new_pw,
+                          "name": new_name.strip(), "role": new_role},
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    st.success(f"User **{new_email}** created. Welcome email sent (if SMTP configured).")
+                    st.rerun()
+                else:
+                    st.error(r.json().get("detail", "Create failed"))
+            except Exception as e:
+                st.error(f"Network error: {e}")
+
+    st.divider()
+
+    # ── Existing users ───────────────────────────────────────────────────────
+    st.subheader("📋 Users")
+    try:
+        users = requests.get(f"{API_URL}/auth/users", timeout=10).json()
+    except Exception as e:
+        st.error(f"Could not load users: {e}")
+        users = []
+
+    if not users:
+        st.info("No users found.")
+    else:
+        st.caption(f"{len(users)} user(s)")
+        _me = (st.session_state.get("user", {}) or {}).get("email", "")
+        for u in users:
+            email = u.get("email", "?")
+            name  = u.get("name", "")
+            role  = u.get("role", "user")
+            cols = st.columns([3, 2, 1, 1, 1])
+            with cols[0]:
+                st.markdown(f"**{email}**" + (" _(you)_" if email == _me else ""))
+                if name:
+                    st.caption(name)
+            with cols[1]:
+                st.markdown(f"_{role}_")
+            with cols[2]:
+                if st.button("🔑 Reset", key=f"reset_{email}", help="Set a new password"):
+                    st.session_state[f"_reset_{email}"] = True
+            with cols[3]:
+                # Delete disabled for self
+                disabled = (email == _me)
+                if st.button("🗑 Delete", key=f"del_{email}",
+                             help="Cannot delete yourself" if disabled else "Delete user",
+                             disabled=disabled):
+                    st.session_state[f"_del_{email}"] = True
+            with cols[4]:
+                pass
+
+            # Inline reset form
+            if st.session_state.get(f"_reset_{email}"):
+                with st.form(f"reset_form_{email}", clear_on_submit=True):
+                    new_pw_admin = st.text_input("New password (≥8 chars)", type="password",
+                                                  key=f"new_pw_{email}")
+                    cc1, cc2 = st.columns(2)
+                    with cc1:
+                        do_reset = st.form_submit_button("Set password", type="primary")
+                    with cc2:
+                        cancel_reset = st.form_submit_button("Cancel")
+                if do_reset:
+                    if len(new_pw_admin) < 8:
+                        st.error("Password must be at least 8 characters")
+                    else:
+                        try:
+                            r = requests.post(
+                                f"{API_URL}/auth/users/{email}/reset-password",
+                                json={"new_password": new_pw_admin}, timeout=10,
+                            )
+                            if r.status_code == 200:
+                                st.success(f"Password reset for **{email}**. Tell the user out-of-band.")
+                                st.session_state.pop(f"_reset_{email}", None)
+                                st.rerun()
+                            else:
+                                st.error(r.json().get("detail", "Reset failed"))
+                        except Exception as e:
+                            st.error(f"Network error: {e}")
+                if cancel_reset:
+                    st.session_state.pop(f"_reset_{email}", None)
+                    st.rerun()
+
+            # Inline delete confirm
+            if st.session_state.get(f"_del_{email}"):
+                st.warning(f"Delete **{email}** permanently? This also removes their chats.")
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    if st.button("Yes, delete", type="primary", key=f"del_yes_{email}"):
+                        try:
+                            r = requests.delete(f"{API_URL}/auth/users/{email}", timeout=10)
+                            if r.status_code == 200:
+                                st.success(f"Deleted **{email}**")
+                                st.session_state.pop(f"_del_{email}", None)
+                                st.rerun()
+                            else:
+                                st.error(r.json().get("detail", "Delete failed"))
+                        except Exception as e:
+                            st.error(f"Network error: {e}")
+                with cc2:
+                    if st.button("Cancel", key=f"del_no_{email}"):
+                        st.session_state.pop(f"_del_{email}", None)
+                        st.rerun()
+            st.divider()
