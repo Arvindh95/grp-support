@@ -18,13 +18,13 @@ from collections import defaultdict
 urllib3.disable_warnings()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-ES_URL      = "https://localhost:9200"
+ES_URL      = os.environ.get("ES_URL",      "https://localhost:9200")
 ES_AUTH     = (os.environ.get("ES_USER", "elastic"), os.environ["ES_PASSWORD"])
-OLLAMA_URL  = "http://localhost:11434"
-EMBED_MODEL = "bge-m3"
-CLAUDE_BIN  = "/home/claudeuser/.local/bin/claude"
-IMG_BASE    = "http://173.212.247.3:8080"
-IMG_DIR     = "/opt/grp-manuals/Doc-Images"
+OLLAMA_URL  = os.environ.get("OLLAMA_URL",  "http://localhost:11434")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
+CLAUDE_BIN  = os.environ.get("CLAUDE_BIN",  "/home/claudeuser/.local/bin/claude")
+IMG_BASE    = os.environ.get("IMG_BASE",    "http://173.212.247.3:8080")
+IMG_DIR     = os.environ.get("IMG_DIR",     "/opt/grp-manuals/Doc-Images")
 
 ALLOWED_TOOLS = (
     "mcp__elasticsearch__search,"
@@ -33,7 +33,7 @@ ALLOWED_TOOLS = (
     "Read,Glob"
 )
 
-CHAT_UPLOAD_DIR = "/tmp/grp-chat"
+CHAT_UPLOAD_DIR = os.environ.get("CHAT_UPLOAD_DIR", "/tmp/grp-chat")
 os.makedirs(CHAT_UPLOAD_DIR, exist_ok=True)
 CHAT_UPLOAD_EXTS = {".pdf", ".md", ".txt", ".docx", ".png", ".jpg", ".jpeg", ".webp", ".csv"}
 CHAT_UPLOAD_MAX_BYTES = 25 * 1024 * 1024
