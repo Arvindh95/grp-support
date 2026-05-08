@@ -22,19 +22,14 @@ ES_URL      = os.environ.get("ES_URL",      "https://localhost:9200")
 ES_AUTH     = (os.environ.get("ES_USER", "elastic"), os.environ["ES_PASSWORD"])
 OLLAMA_URL  = os.environ.get("OLLAMA_URL",  "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
-CLAUDE_BIN  = os.environ.get("CLAUDE_BIN",  "/home/claudeuser/.local/bin/claude")
+CLAUDE_BIN  = os.environ.get("CLAUDE_BIN",  "/home/claudeuser/.local/bin/claude")  # legacy; unused after SDK migration
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+ANTHROPIC_MODEL   = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 JWT_SECRET  = os.environ["JWT_SECRET"]
 JWT_ALG     = "HS256"
 JWT_TTL_HOURS = int(os.environ.get("JWT_TTL_HOURS", "12"))
 IMG_BASE    = os.environ.get("IMG_BASE",    "http://173.212.247.3:8080")
 IMG_DIR     = os.environ.get("IMG_DIR",     "/opt/grp-manuals/Doc-Images")
-
-ALLOWED_TOOLS = (
-    "mcp__elasticsearch__search,"
-    "mcp__elasticsearch__list_indices,"
-    "mcp__elasticsearch__get_mappings,"
-    "Read,Glob"
-)
 
 CHAT_UPLOAD_DIR = os.environ.get("CHAT_UPLOAD_DIR", "/tmp/grp-chat")
 os.makedirs(CHAT_UPLOAD_DIR, exist_ok=True)
@@ -126,7 +121,7 @@ RFS_MAPPING = {
 
 # ── Agent System Prompt ─────────────────────────────────────────────────────────
 AGENT_SYSTEM_PROMPT = """You are GRP ERP Support AI — a search-first support agent for CENSOF internal support engineers (Century Software, Malaysia).
-You are the PRIMARY search agent. You drive all retrieval via Elasticsearch MCP tools. Do not rely solely on initial context — always search.
+You are the PRIMARY search agent. You drive all retrieval via Elasticsearch search tools. Do not rely solely on initial context — always search.
 
 === STEP 0 — CLARIFY IF VAGUE ===
 Before searching, judge if the question is too vague to give a useful answer.
@@ -840,41 +835,157 @@ def format_history(history: list) -> str:
     return "\n".join(parts) + "\n\n"
 
 
+import anthropic
+
+_anthropic = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+ES_TOOLS = [
+    {
+        "name": "es_search",
+        "description": (
+            "Search an Elasticsearch index. `body` is a standard ES query DSL "
+            "(query, size, _source, sort, etc.). Returns the raw ES response."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "index": {"type": "string"},
+                "body":  {"type": "object"},
+            },
+            "required": ["index", "body"],
+        },
+    },
+    {
+        "name": "es_list_indices",
+        "description": "List all available Elasticsearch indices with doc counts.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "es_get_mappings",
+        "description": "Return the field mappings for an Elasticsearch index.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"index": {"type": "string"}},
+            "required": ["index"],
+        },
+    },
+]
+
+_TOOL_RESULT_CAP = 50_000  # per call; oversized ES responses get truncated
+_MAX_TOOL_ITERS  = 20      # hard ceiling on agent loop
+
+
+def _tool_es_search(input_: dict) -> str:
+    r = requests.post(
+        f"{ES_URL}/{input_['index']}/_search",
+        auth=ES_AUTH, verify=False, json=input_["body"], timeout=30,
+    )
+    return r.text
+
+
+def _tool_es_list_indices(_: dict) -> str:
+    r = requests.get(f"{ES_URL}/_cat/indices?format=json",
+                     auth=ES_AUTH, verify=False, timeout=10)
+    return r.text
+
+
+def _tool_es_get_mappings(input_: dict) -> str:
+    r = requests.get(f"{ES_URL}/{input_['index']}/_mapping",
+                     auth=ES_AUTH, verify=False, timeout=10)
+    return r.text
+
+
+_TOOL_DISPATCH = {
+    "es_search":        _tool_es_search,
+    "es_list_indices":  _tool_es_list_indices,
+    "es_get_mappings":  _tool_es_get_mappings,
+}
+
+
+def _run_tool(name: str, input_: dict) -> str:
+    fn = _TOOL_DISPATCH.get(name)
+    if fn is None:
+        return f"Unknown tool: {name}"
+    try:
+        out = fn(input_ or {})
+    except Exception as e:
+        return f"Tool error: {e}"
+    if len(out) > _TOOL_RESULT_CAP:
+        out = out[:_TOOL_RESULT_CAP] + "\n...[truncated]"
+    return out
+
+
+def _read_attached_file_text(path: str, max_bytes: int = 200_000) -> str:
+    try:
+        with open(path, "rb") as f:
+            content = f.read(max_bytes)
+        return content.decode("utf-8", errors="replace")
+    except Exception as e:
+        return f"[failed to read {path}: {e}]"
+
+
 def call_claude_agent(question: str, seed_context: str,
                       history: list = None,
                       attached_files: list = None) -> str:
     history_text = format_history(history or [])
-    files_block = ""
     safe_files = [p for p in (attached_files or [])
                   if isinstance(p, str) and p.startswith(CHAT_UPLOAD_DIR + "/") and os.path.exists(p)]
+    files_block = ""
     if safe_files:
+        chunks = []
+        for p in safe_files:
+            chunks.append(f"--- FILE: {os.path.basename(p)} ---\n"
+                          + _read_attached_file_text(p))
         files_block = (
-            "USER ATTACHED FILES — read each with the Read tool BEFORE answering. "
-            "Cite their content alongside knowledge-base sources:\n"
-            + "\n".join(f"- {p}" for p in safe_files)
-            + "\n\n"
+            "USER ATTACHED FILES — content embedded below; cite alongside knowledge-base sources:\n\n"
+            + "\n\n".join(chunks) + "\n\n"
         )
-    prompt = (
-        f"{AGENT_SYSTEM_PROMPT}\n\n"
+
+    user_text = (
         f"{history_text}"
         f"{files_block}"
         f"INITIAL CONTEXT (kNN semantic seed — treat as incomplete starting point):\n"
         f"{seed_context}\n\n"
         f"USER QUESTION: {question}\n\n"
-        f"Now search Elasticsearch via MCP tools (and Read attached files if any), then answer:"
+        f"Now search Elasticsearch via the available tools, then answer."
     )
-    cmd = [CLAUDE_BIN, "-p", prompt,
-           "--allowedTools", ALLOWED_TOOLS,
-           "--dangerously-skip-permissions"]
+
+    messages: list = [{"role": "user", "content": user_text}]
+
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            timeout=240, encoding="utf-8", errors="replace",
-            cwd="/home/claudeuser"
-        )
-        return _strip_escape(result.stdout) or "No response from Claude."
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="Claude timed out (>240s)")
+        for _step in range(_MAX_TOOL_ITERS):
+            resp = _anthropic.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=8000,
+                system=[{
+                    "type": "text",
+                    "text": AGENT_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                tools=ES_TOOLS,
+                messages=messages,
+            )
+            if resp.stop_reason == "tool_use":
+                messages.append({"role": "assistant", "content": resp.content})
+                tool_results = []
+                for block in resp.content:
+                    if block.type == "tool_use":
+                        out = _run_tool(block.name, block.input or {})
+                        tool_results.append({
+                            "type":        "tool_result",
+                            "tool_use_id": block.id,
+                            "content":     out,
+                        })
+                messages.append({"role": "user", "content": tool_results})
+                continue
+            # end_turn / stop_sequence / max_tokens — assemble final text
+            text = "".join(b.text for b in resp.content if b.type == "text")
+            return text or "No response from Claude."
+        return "Tool loop exceeded max iterations — partial answer unavailable."
+    except anthropic.APIStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Anthropic API error: {e.message}")
+    except anthropic.APITimeoutError:
+        raise HTTPException(status_code=504, detail="Anthropic API timed out")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Claude error: {e}")
 
