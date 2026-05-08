@@ -116,8 +116,13 @@ def render_assistant_msg(msg, show_sources, show_images):
     if show_sources and msg.get("sources"):
         with st.expander(f"📎 Sources ({len(msg['sources'])})"):
             render_sources(msg["sources"])
+    # Screenshots render inline inside msg["content"] via markdown image refs.
+    # Cluster fallback below shows only images Claude did NOT already embed inline.
     if show_images and msg.get("images"):
-        render_images(msg["images"])
+        inlined = set(re.findall(r'!\[[^\]]*\]\(([^)]+)\)', msg.get("content", "")))
+        leftover = [im for im in msg["images"] if im.get("url") not in inlined]
+        if leftover:
+            render_images(leftover)
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -615,99 +620,178 @@ elif page == "📤 Upload Documents":
 
     doc_type = st.selectbox(
         "Document Type",
-        ["Manual (.md)", "RFS Tickets (.xlsx / .csv)", "SQL Script (.txt)", "Code (.py / .cs / .sql)"],
+        ["Manual (.docx / .md)", "Manual Images (.zip)", "RFS Tickets (.xlsx / .csv)", "SQL Script (.txt)", "Code (.py / .cs / .sql)"],
         key="doc_type_select"
     )
 
     st.divider()
 
     # ── MANUAL ──────────────────────────────────────────────────────────────
-    if doc_type == "Manual (.md)":
-        st.subheader("Upload Manual (Markdown)")
-        st.caption("File will be chunked by headings. Review sections before indexing.")
+    if doc_type == "Manual (.docx / .md)":
+        st.subheader("Upload Manual (.docx or .md)")
 
-        module_override = st.text_input(
-            "Module Name Override",
-            placeholder="e.g. Account Payable — leave blank to auto-detect from filename",
-            key="manual_module"
+        manual_mode = st.radio(
+            "Upload mode",
+            ["Single (preview & edit sections)", "Bulk (auto-index all, no preview)"],
+            key="manual_mode",
+            horizontal=True,
         )
-        manual_file = st.file_uploader("Upload .md file", type=["md"], key="manual_file")
 
-        if manual_file:
-            if st.button("Preview Sections", key="manual_preview"):
-                with st.spinner("Parsing sections..."):
-                    meta = {"confirm": False, "module": module_override or ""}
+        # ── BULK MODE ────────────────────────────────────────────────────────
+        if manual_mode.startswith("Bulk"):
+            st.caption("Each file is auto-chunked by headings, module name auto-detected from filename. No preview.")
+            bulk_files = st.file_uploader(
+                "Upload .docx or .md files",
+                type=["docx", "md"],
+                accept_multiple_files=True,
+                key="manual_bulk_files",
+            )
+            if bulk_files and st.button(f"📦 Index {len(bulk_files)} file(s)", type="primary", key="manual_bulk_go"):
+                progress = st.progress(0.0)
+                status = st.empty()
+                summary = []
+                for i, f in enumerate(bulk_files, 1):
+                    status.write(f"[{i}/{len(bulk_files)}] {f.name}")
+                    meta = {"confirm": True, "module": ""}
                     try:
                         resp = requests.post(
                             f"{API_URL}/upload-document",
-                            files={"file": (manual_file.name, manual_file.getvalue(), "text/plain")},
+                            files={"file": (f.name, f.getvalue(), "text/plain")},
                             data={"doc_type": "manual", "metadata": json.dumps(meta)},
-                            timeout=30
+                            timeout=600,
                         )
                         if resp.status_code == 200:
-                            result = resp.json()
-                            st.session_state["manual_preview"] = result
-                            st.session_state["manual_file_bytes"] = manual_file.getvalue()
-                            st.session_state["manual_filename"]   = manual_file.name
+                            r = resp.json()
+                            summary.append(f"✅ {f.name}: {r.get('chunks_indexed', 0)} chunks (errors: {r.get('errors', 0)})")
                         else:
-                            st.error(f"Error: {resp.json().get('detail', resp.text[:200])}")
+                            summary.append(f"❌ {f.name}: {resp.json().get('detail', resp.text[:200])}")
                     except Exception as e:
-                        st.error(f"Error: {e}")
+                        summary.append(f"❌ {f.name}: {e}")
+                    progress.progress(i / len(bulk_files))
+                status.empty()
+                st.success(f"Done. {len(bulk_files)} file(s) processed.")
+                for line in summary:
+                    st.write(line)
 
-        if st.session_state.get("manual_preview"):
-            result = st.session_state["manual_preview"]
-            st.success(f"Found {result['chunks']} sections in module: **{result['module']}**")
+        # ── SINGLE MODE (existing flow) ──────────────────────────────────────
+        else:
+            st.caption("File will be chunked by headings. Review sections before indexing.")
 
-            df = pd.DataFrame(result["preview"])
-            edited_df = st.data_editor(
-                df[["original_section", "section", "content_preview", "image_count"]],
-                column_config={
-                    "original_section": st.column_config.TextColumn("Original", disabled=True),
-                    "section":          st.column_config.TextColumn("Section Name (editable)"),
-                    "content_preview":  st.column_config.TextColumn("Preview", disabled=True),
-                    "image_count":      st.column_config.NumberColumn("Images", disabled=True),
-                },
-                use_container_width=True,
-                key="manual_editor"
+            module_override = st.text_input(
+                "Module Name Override",
+                placeholder="e.g. Account Payable — leave blank to auto-detect from filename",
+                key="manual_module"
             )
+            manual_file = st.file_uploader("Upload .docx or .md file", type=["docx", "md"], key="manual_file")
 
-            col1, col2 = st.columns([1, 4])
-            with col1:
-                if st.button("✅ Confirm & Index", type="primary", key="manual_confirm"):
-                    overrides = {
-                        row["original_section"]: row["section"]
-                        for _, row in edited_df.iterrows()
-                        if row["original_section"] != row["section"]
-                    }
-                    meta = {
-                        "confirm": True,
-                        "module": module_override or result["module"],
-                        "overrides": overrides
-                    }
-                    with st.spinner("Embedding and indexing..."):
+            if manual_file:
+                if st.button("Preview Sections", key="manual_preview"):
+                    with st.spinner("Parsing sections..."):
+                        meta = {"confirm": False, "module": module_override or ""}
                         try:
                             resp = requests.post(
                                 f"{API_URL}/upload-document",
-                                files={"file": (
-                                    st.session_state["manual_filename"],
-                                    st.session_state["manual_file_bytes"],
-                                    "text/plain"
-                                )},
+                                files={"file": (manual_file.name, manual_file.getvalue(), "text/plain")},
                                 data={"doc_type": "manual", "metadata": json.dumps(meta)},
-                                timeout=300
+                                timeout=30
                             )
                             if resp.status_code == 200:
-                                r = resp.json()
-                                st.success(f"Indexed {r['chunks_indexed']} chunks into grp-manuals. Errors: {r['errors']}")
-                                del st.session_state["manual_preview"]
+                                result = resp.json()
+                                st.session_state["manual_preview_data"] = result
+                                st.session_state["manual_file_bytes"] = manual_file.getvalue()
+                                st.session_state["manual_filename"]   = manual_file.name
                             else:
                                 st.error(f"Error: {resp.json().get('detail', resp.text[:200])}")
                         except Exception as e:
                             st.error(f"Error: {e}")
-            with col2:
-                if st.button("✖ Cancel", key="manual_cancel"):
-                    del st.session_state["manual_preview"]
-                    st.rerun()
+
+            if st.session_state.get("manual_preview_data"):
+                result = st.session_state["manual_preview_data"]
+                st.success(f"Found {result['chunks']} sections in module: **{result['module']}**")
+
+                df = pd.DataFrame(result["preview"])
+                edited_df = st.data_editor(
+                    df[["original_section", "section", "content_preview", "image_count"]],
+                    column_config={
+                        "original_section": st.column_config.TextColumn("Original", disabled=True),
+                        "section":          st.column_config.TextColumn("Section Name (editable)"),
+                        "content_preview":  st.column_config.TextColumn("Preview", disabled=True),
+                        "image_count":      st.column_config.NumberColumn("Images", disabled=True),
+                    },
+                    use_container_width=True,
+                    key="manual_editor"
+                )
+
+                col1, col2 = st.columns([1, 4])
+                with col1:
+                    if st.button("✅ Confirm & Index", type="primary", key="manual_confirm"):
+                        overrides = {
+                            row["original_section"]: row["section"]
+                            for _, row in edited_df.iterrows()
+                            if row["original_section"] != row["section"]
+                        }
+                        meta = {
+                            "confirm": True,
+                            "module": module_override or result["module"],
+                            "overrides": overrides
+                        }
+                        with st.spinner("Embedding and indexing..."):
+                            try:
+                                resp = requests.post(
+                                    f"{API_URL}/upload-document",
+                                    files={"file": (
+                                        st.session_state["manual_filename"],
+                                        st.session_state["manual_file_bytes"],
+                                        "text/plain"
+                                    )},
+                                    data={"doc_type": "manual", "metadata": json.dumps(meta)},
+                                    timeout=300
+                                )
+                                if resp.status_code == 200:
+                                    r = resp.json()
+                                    st.success(f"Indexed {r['chunks_indexed']} chunks into grp-manuals. Errors: {r['errors']}")
+                                    del st.session_state["manual_preview_data"]
+                                else:
+                                    st.error(f"Error: {resp.json().get('detail', resp.text[:200])}")
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+                with col2:
+                    if st.button("✖ Cancel", key="manual_cancel"):
+                        del st.session_state["manual_preview_data"]
+                        st.rerun()
+
+    # ── MANUAL IMAGES (ZIP) ─────────────────────────────────────────────────
+    elif doc_type == "Manual Images (.zip)":
+        st.subheader("Bulk Upload Manual Screenshots")
+        st.caption(
+            "Zip your local Images/ folder (with per-module subfolders inside) and upload here. "
+            "Files extract to /opt/grp-manuals/Doc-Images/ preserving folders. Re-upload overwrites existing."
+        )
+        zip_file = st.file_uploader("Upload images .zip", type=["zip"], key="img_zip_file")
+        if zip_file:
+            st.info(f"Selected: {zip_file.name} — {zip_file.size / 1024 / 1024:.1f} MB")
+            if st.button("📦 Extract & Upload", type="primary", key="img_zip_go"):
+                with st.spinner("Uploading and extracting..."):
+                    try:
+                        resp = requests.post(
+                            f"{API_URL}/upload-images-zip",
+                            files={"file": (zip_file.name, zip_file.getvalue(), "application/zip")},
+                            timeout=600,
+                        )
+                        if resp.status_code == 200:
+                            r = resp.json()
+                            st.success(
+                                f"Extracted {r['extracted']} image(s) → {r['img_dir']}. "
+                                f"Skipped: {r['skipped']}."
+                            )
+                            if r.get("skipped_examples"):
+                                with st.expander("Skipped files"):
+                                    for name in r["skipped_examples"]:
+                                        st.code(name)
+                        else:
+                            st.error(f"Error: {resp.json().get('detail', resp.text[:200])}")
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
     # ── RFS TICKETS ──────────────────────────────────────────────────────────
     elif doc_type == "RFS Tickets (.xlsx / .csv)":
