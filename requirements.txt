@@ -1,4 +1,14 @@
+# Frontend (grp_chat.py — Streamlit on :8501)
 streamlit
 requests
 urllib3
 pandas
+
+# Backend (api_server.py — FastAPI/uvicorn on :8000)
+fastapi
+uvicorn
+pydantic
+python-multipart
+
+# Loaders (load_manuals.py, load_rfs_embed.py)
+xlrd
