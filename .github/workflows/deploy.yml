@@ -29,8 +29,23 @@ jobs:
             cd /opt/grp-chat
             sudo -u claudeuser git fetch origin
             sudo -u claudeuser git reset --hard origin/main
-            # Best-effort dep install — keep going if pip changed nothing
+
+            # Backend deps (best-effort — keep going if pip changed nothing)
             sudo -u claudeuser pip install --break-system-packages --user -r requirements.txt || true
+
+            # Frontend build (skip if no /web changes by checking package-lock.json mtime vs out/)
+            if [ -d /opt/grp-chat/web ]; then
+              cd /opt/grp-chat/web
+              sudo -u claudeuser npm ci --silent --no-audit --no-fund
+              sudo -u claudeuser npm run build
+              # Atomically swap into the nginx-served dir
+              sudo rm -rf /opt/grp-chat-web/*
+              sudo cp -r out/. /opt/grp-chat-web/
+              sudo chown -R www-data:www-data /opt/grp-chat-web 2>/dev/null || true
+              cd /opt/grp-chat
+            fi
+
             sudo systemctl restart grp-api grp-chat
             sleep 3
             curl -fsS http://127.0.0.1:8000/health
+            curl -fsS -o /dev/null http://127.0.0.1:8083/login/
