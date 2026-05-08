@@ -343,6 +343,8 @@ app.add_middleware(
         "http://127.0.0.1:8501",
         "http://localhost:8501",
         "http://173.212.247.3:8081",
+        "http://173.212.247.3:8083",  # Next.js static export served by nginx
+        "http://localhost:3000",       # Next.js dev server
     ],
     allow_methods=["*"],
     allow_headers=["*"],
