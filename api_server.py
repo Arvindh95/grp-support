@@ -551,20 +551,22 @@ def log_kv(level: str, msg: str, **kv) -> None:
 
 # ── Audit log ─────────────────────────────────────────────────────────────────
 def write_audit(user_email: str, event: str, **fields) -> None:
-    """Best-effort fire-and-forget audit write; failures only log, never raise."""
+    """Fire-and-forget audit write on a daemon thread; failures only log."""
     doc = {
         "ts":    _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "user":  user_email,
         "event": event,
         **{k: v for k, v in fields.items() if v is not None},
     }
-    try:
-        requests.post(
-            f"{ES_URL}/{AUDIT_INDEX}/_doc",
-            auth=ES_AUTH, verify=False, json=doc, timeout=3,
-        )
-    except Exception as e:
-        log_kv("warning", "audit-write-failed", err=str(e))
+    def _send():
+        try:
+            requests.post(
+                f"{ES_URL}/{AUDIT_INDEX}/_doc",
+                auth=ES_AUTH, verify=False, json=doc, timeout=5,
+            )
+        except Exception as e:
+            log_kv("warning", "audit-write-failed", err=str(e))
+    _threading.Thread(target=_send, daemon=True).start()
 
 
 @app.get("/audit", dependencies=[Depends(require_admin)])
