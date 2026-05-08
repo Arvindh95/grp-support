@@ -417,7 +417,7 @@ def auth_change_password(req: ChangePasswordReq, user: dict = Depends(current_us
     if len(req.new_password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters")
     r = requests.post(
-        f"{ES_URL}/{USERS_INDEX}/_update_by_query?refresh=wait_for",
+        f"{ES_URL}/{USERS_INDEX}/_update_by_query?refresh=true",
         auth=ES_AUTH, verify=False,
         json={
             "script": {

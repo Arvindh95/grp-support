@@ -54,7 +54,7 @@ def ensure_admin(email: str, password: str, name: str = "Admin") -> None:
 
 def backfill_chat_owner(email: str) -> None:
     r = requests.post(
-        f"{ES_URL}/{CHATS_INDEX}/_update_by_query?refresh=wait_for&conflicts=proceed",
+        f"{ES_URL}/{CHATS_INDEX}/_update_by_query?refresh=true&conflicts=proceed",
         auth=ES_AUTH, verify=False,
         json={
             "script": {"source": "ctx._source.owner = params.o", "params": {"o": email}},
