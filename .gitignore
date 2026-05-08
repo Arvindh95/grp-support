@@ -8,3 +8,6 @@ venv/
 *.bak
 *.bak.*
 .streamlit/secrets.toml
+
+# graphify build artifacts
+graphify-out/
