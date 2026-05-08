@@ -4,12 +4,11 @@
 const TOKEN_COOKIE = "grp_jwt";
 const USER_COOKIE = "grp_user";
 
+// Default: same-origin /api proxied by nginx to FastAPI on 127.0.0.1:8000.
+// Override with NEXT_PUBLIC_API_URL when developing against a remote backend.
 export const API_URL =
   process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ||
-  // Default: same host as the frontend, port 8000
-  (typeof window !== "undefined"
-    ? `${window.location.protocol}//${window.location.hostname}:8000`
-    : "http://127.0.0.1:8000");
+  (typeof window !== "undefined" ? `${window.location.origin}/api` : "/api");
 
 export function getToken(): string | null {
   if (typeof document === "undefined") return null;
