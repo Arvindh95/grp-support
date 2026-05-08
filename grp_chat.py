@@ -13,6 +13,42 @@ urllib3.disable_warnings()
 
 API_URL = "http://127.0.0.1:8000"
 
+
+# ── Auth glue ─────────────────────────────────────────────────────────────────
+# Monkey-patch requests.{get,post,put,delete,patch} so calls to API_URL
+# auto-include the JWT from session_state and surface 401s as a re-login.
+
+def _auth_headers() -> dict:
+    tok = st.session_state.get("token")
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+
+def _on_401():
+    if st.session_state.get("token"):
+        st.session_state.pop("token", None)
+        st.session_state.pop("user", None)
+        st.session_state["_auth_error"] = "Session expired. Please log in again."
+        st.rerun()
+
+
+_orig_req = {m: getattr(requests, m) for m in ("get", "post", "put", "delete", "patch")}
+
+
+def _make_wrapped(method_name: str):
+    fn = _orig_req[method_name]
+    def _wrapped(url, **kw):
+        if isinstance(url, str) and url.startswith(API_URL):
+            kw["headers"] = {**(kw.get("headers") or {}), **_auth_headers()}
+        r = fn(url, **kw)
+        if isinstance(url, str) and url.startswith(API_URL) and r.status_code == 401:
+            _on_401()
+        return r
+    return _wrapped
+
+
+for _m in _orig_req:
+    setattr(requests, _m, _make_wrapped(_m))
+
 ALL_INDICES = {
     "grp-manuals":          "GRP System Manuals",
     "grp-scripts":          "GRP SQL Fix Scripts",
@@ -34,6 +70,48 @@ SAMPLE_QUESTIONS = [
 ]
 
 st.set_page_config(page_title="GRP Support AI", page_icon="🤖", layout="wide")
+
+
+# ── Login gate ────────────────────────────────────────────────────────────────
+
+def _render_login():
+    st.title("🤖 GRP Support AI")
+    if msg := st.session_state.pop("_auth_error", None):
+        st.warning(msg)
+    with st.form("login_form"):
+        email = st.text_input("Email", autocomplete="email")
+        pw    = st.text_input("Password", type="password", autocomplete="current-password")
+        ok    = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+    if ok:
+        try:
+            r = _orig_req["post"](
+                f"{API_URL}/auth/login",
+                json={"email": email.strip(), "password": pw},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                st.session_state["token"] = data["access_token"]
+                st.session_state["user"]  = {
+                    "email": data["email"],
+                    "role":  data["role"],
+                    "name":  data.get("name", ""),
+                }
+                st.rerun()
+            else:
+                detail = ""
+                try:
+                    detail = r.json().get("detail", "")
+                except Exception:
+                    detail = r.text[:200]
+                st.error(detail or "Login failed")
+        except Exception as e:
+            st.error(f"Network error: {e}")
+
+
+if not st.session_state.get("token"):
+    _render_login()
+    st.stop()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -129,6 +207,42 @@ def render_assistant_msg(msg, show_sources, show_images):
 with st.sidebar:
     st.title("🤖 GRP Support AI")
     st.caption("Powered by Claude + Elasticsearch")
+
+    _u = st.session_state.get("user", {})
+    _label = _u.get("name") or _u.get("email", "")
+    _role  = _u.get("role", "user")
+    st.caption(f"Signed in as **{_label}** · _{_role}_")
+
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        if st.button("🔒 Password", key="pw_btn", use_container_width=True):
+            st.session_state["_show_pw_dialog"] = True
+    with _c2:
+        if st.button("Sign out", key="logout_btn", use_container_width=True):
+            for _k in ("token", "user", "messages", "current_chat_id", "current_chat_title"):
+                st.session_state.pop(_k, None)
+            st.rerun()
+
+    if st.session_state.get("_show_pw_dialog"):
+        with st.form("pw_form"):
+            old = st.text_input("Current password", type="password", key="pw_old")
+            new = st.text_input("New password (≥8 chars)", type="password", key="pw_new")
+            ok  = st.form_submit_button("Change", type="primary")
+        if ok:
+            try:
+                r = requests.post(
+                    f"{API_URL}/auth/change-password",
+                    json={"old_password": old, "new_password": new},
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    st.success("Password updated")
+                    st.session_state["_show_pw_dialog"] = False
+                else:
+                    st.error(r.json().get("detail", "Failed"))
+            except Exception as e:
+                st.error(str(e))
+
     st.divider()
 
     page = st.radio(

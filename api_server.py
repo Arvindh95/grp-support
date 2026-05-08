@@ -23,6 +23,9 @@ ES_AUTH     = (os.environ.get("ES_USER", "elastic"), os.environ["ES_PASSWORD"])
 OLLAMA_URL  = os.environ.get("OLLAMA_URL",  "http://localhost:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 CLAUDE_BIN  = os.environ.get("CLAUDE_BIN",  "/home/claudeuser/.local/bin/claude")
+JWT_SECRET  = os.environ["JWT_SECRET"]
+JWT_ALG     = "HS256"
+JWT_TTL_HOURS = int(os.environ.get("JWT_TTL_HOURS", "12"))
 IMG_BASE    = os.environ.get("IMG_BASE",    "http://173.212.247.3:8080")
 IMG_DIR     = os.environ.get("IMG_DIR",     "/opt/grp-manuals/Doc-Images")
 
@@ -46,6 +49,7 @@ RFS_INDICES = [
 SCRIPTS_INDEX = "grp-scripts"
 CODE_INDEX    = "grp-code"
 CHATS_INDEX   = "grp-chats"
+USERS_INDEX   = "grp-users"
 
 MONTH_INDEX_MAP = {
     1: "rfs-tickets-jan-2025", 2: "rfs-tickets-feb-2025",
@@ -78,9 +82,23 @@ CHATS_MAPPING = {
     "mappings": {
         "properties": {
             "title":      {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+            "owner":      {"type": "keyword"},
             "created_at": {"type": "date"},
             "updated_at": {"type": "date"},
             "messages":   {"type": "object", "enabled": False}
+        }
+    }
+}
+
+USERS_MAPPING = {
+    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {
+        "properties": {
+            "email":         {"type": "keyword"},
+            "password_hash": {"type": "keyword", "index": False},
+            "name":          {"type": "text"},
+            "role":          {"type": "keyword"},
+            "created_at":    {"type": "long"},
         }
     }
 }
@@ -261,12 +279,171 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     """Ensure auxiliary indices exist on startup."""
-    for idx, mapping in [(CODE_INDEX, CODE_MAPPING), (CHATS_INDEX, CHATS_MAPPING)]:
+    for idx, mapping in [(CODE_INDEX, CODE_MAPPING), (CHATS_INDEX, CHATS_MAPPING), (USERS_INDEX, USERS_MAPPING)]:
         r = requests.get(f"{ES_URL}/{idx}", auth=ES_AUTH, verify=False)
         if r.status_code == 404:
             requests.put(f"{ES_URL}/{idx}", json=mapping,
                          auth=ES_AUTH, verify=False)
             print(f"Created index: {idx}")
+
+
+# ── Auth ───────────────────────────────────────────────────────────────────────
+import bcrypt
+import jwt as _jwt
+import datetime as _dt
+import time as _time
+from fastapi import Depends, status
+from fastapi.security import OAuth2PasswordBearer
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
+
+
+def hash_password(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(pw: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(pw.encode(), hashed.encode())
+    except Exception:
+        return False
+
+
+def make_token(email: str, role: str) -> str:
+    now = _dt.datetime.now(_dt.timezone.utc)
+    payload = {
+        "sub":  email,
+        "role": role,
+        "iat":  int(now.timestamp()),
+        "exp":  int((now + _dt.timedelta(hours=JWT_TTL_HOURS)).timestamp()),
+    }
+    return _jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+def get_user_by_email(email: str) -> dict | None:
+    r = requests.post(
+        f"{ES_URL}/{USERS_INDEX}/_search",
+        auth=ES_AUTH, verify=False,
+        json={"query": {"term": {"email": email}}, "size": 1},
+        timeout=5,
+    )
+    if r.status_code != 200:
+        return None
+    hits = r.json().get("hits", {}).get("hits", [])
+    return hits[0]["_source"] if hits else None
+
+
+def current_user(token: str | None = Depends(oauth2_scheme)) -> dict:
+    if not token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing token")
+    try:
+        payload = _jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except _jwt.ExpiredSignatureError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token expired")
+    except _jwt.PyJWTError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token")
+    return {"email": payload["sub"], "role": payload.get("role", "user")}
+
+
+def require_admin(user: dict = Depends(current_user)) -> dict:
+    if user.get("role") != "admin":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin only")
+    return user
+
+
+class LoginReq(BaseModel):
+    email:    str
+    password: str
+
+
+class RegisterReq(BaseModel):
+    email:    str
+    password: str
+    name:     str = ""
+    role:     str = "user"
+
+
+@app.post("/auth/login")
+def auth_login(req: LoginReq) -> dict:
+    user = get_user_by_email(req.email)
+    if not user or not verify_password(req.password, user.get("password_hash", "")):
+        raise HTTPException(401, "Invalid credentials")
+    role = user.get("role", "user")
+    return {
+        "access_token": make_token(req.email, role),
+        "token_type":   "bearer",
+        "email":        req.email,
+        "role":         role,
+        "name":         user.get("name", ""),
+    }
+
+
+@app.get("/auth/me")
+def auth_me(user: dict = Depends(current_user)) -> dict:
+    return user
+
+
+@app.post("/auth/register", dependencies=[Depends(require_admin)])
+def auth_register(req: RegisterReq) -> dict:
+    if get_user_by_email(req.email):
+        raise HTTPException(409, "User already exists")
+    role = req.role if req.role in ("user", "admin") else "user"
+    doc = {
+        "email":         req.email,
+        "password_hash": hash_password(req.password),
+        "name":          req.name,
+        "role":          role,
+        "created_at":    int(_time.time() * 1000),
+    }
+    r = requests.post(
+        f"{ES_URL}/{USERS_INDEX}/_doc?refresh=wait_for",
+        auth=ES_AUTH, verify=False, json=doc, timeout=10,
+    )
+    if r.status_code not in (200, 201):
+        raise HTTPException(500, f"Register failed: {r.text[:200]}")
+    return {"ok": True, "email": req.email, "role": role}
+
+
+class ChangePasswordReq(BaseModel):
+    old_password: str
+    new_password: str
+
+
+@app.post("/auth/change-password")
+def auth_change_password(req: ChangePasswordReq, user: dict = Depends(current_user)) -> dict:
+    src = get_user_by_email(user["email"])
+    if not src or not verify_password(req.old_password, src.get("password_hash", "")):
+        raise HTTPException(401, "Invalid credentials")
+    if len(req.new_password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    r = requests.post(
+        f"{ES_URL}/{USERS_INDEX}/_update_by_query?refresh=wait_for",
+        auth=ES_AUTH, verify=False,
+        json={
+            "script": {
+                "source": "ctx._source.password_hash = params.h",
+                "params": {"h": hash_password(req.new_password)},
+            },
+            "query": {"term": {"email": user["email"]}},
+        },
+        timeout=10,
+    )
+    if r.status_code != 200:
+        raise HTTPException(500, f"Update failed: {r.text[:200]}")
+    return {"ok": True}
+
+
+@app.get("/auth/users", dependencies=[Depends(require_admin)])
+def auth_users() -> list[dict]:
+    r = requests.post(
+        f"{ES_URL}/{USERS_INDEX}/_search",
+        auth=ES_AUTH, verify=False,
+        json={"size": 200, "_source": ["email", "name", "role", "created_at"],
+              "sort": [{"created_at": {"order": "desc"}}]},
+        timeout=10,
+    )
+    hits = r.json().get("hits", {}).get("hits", []) if r.status_code == 200 else []
+    return [h["_source"] for h in hits]
 
 
 # ── Models ─────────────────────────────────────────────────────────────────────
@@ -767,7 +944,7 @@ def health():
     return {"status": "ok", "version": "3.1.0-agent"}
 
 
-@app.get("/indices")
+@app.get("/indices", dependencies=[Depends(current_user)])
 def list_indices():
     result = {}
     for idx in ["grp-manuals", SCRIPTS_INDEX, CODE_INDEX] + RFS_INDICES:
@@ -780,7 +957,7 @@ def list_indices():
     return result
 
 
-@app.post("/query", response_model=QueryResponse)
+@app.post("/query", response_model=QueryResponse, dependencies=[Depends(current_user)])
 def query(req: QueryRequest):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Empty question")
@@ -813,7 +990,7 @@ def query(req: QueryRequest):
 
 # ── Routes: Module / Section lookup ────────────────────────────────────────────
 
-@app.get("/modules")
+@app.get("/modules", dependencies=[Depends(current_user)])
 def get_modules() -> list[str]:
     r = requests.post(
         f"{ES_URL}/grp-manuals/_search",
@@ -824,7 +1001,7 @@ def get_modules() -> list[str]:
     return sorted(b["key"] for b in buckets)
 
 
-@app.get("/sections")
+@app.get("/sections", dependencies=[Depends(current_user)])
 def get_sections(module: str = Query(...)) -> list[str]:
     r = requests.post(
         f"{ES_URL}/grp-manuals/_search",
@@ -839,7 +1016,7 @@ def get_sections(module: str = Query(...)) -> list[str]:
     return sorted(b["key"] for b in buckets)
 
 
-@app.get("/section-images")
+@app.get("/section-images", dependencies=[Depends(current_user)])
 def get_section_images(module: str = Query(...), section: str = Query(...)) -> dict:
     doc_id, src = _find_section_doc(module, section)
     if not src:
@@ -859,7 +1036,7 @@ def get_section_images(module: str = Query(...), section: str = Query(...)) -> d
 
 # ── Routes: Chat file upload (one-shot, Claude reads at query time) ────────────
 
-@app.post("/upload-chat-file")
+@app.post("/upload-chat-file", dependencies=[Depends(current_user)])
 async def upload_chat_file(file: UploadFile = File(...)) -> dict:
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in CHAT_UPLOAD_EXTS:
@@ -889,7 +1066,7 @@ async def upload_chat_file(file: UploadFile = File(...)) -> dict:
 
 # ── Routes: Image upload / delete ──────────────────────────────────────────────
 
-@app.post("/upload-image")
+@app.post("/upload-image", dependencies=[Depends(require_admin)])
 async def upload_image(
     file:    UploadFile = File(...),
     module:  str = Form(...),
@@ -941,7 +1118,7 @@ async def upload_image(
     return {"status": "ok", "filename": filename, "url": img_url}
 
 
-@app.delete("/delete-image")
+@app.delete("/delete-image", dependencies=[Depends(require_admin)])
 def delete_image(module: str, section: str, filename: str) -> dict:
     doc_id, _ = _find_section_doc(module, section)
     if not doc_id:
@@ -976,7 +1153,7 @@ def delete_image(module: str, section: str, filename: str) -> dict:
 
 # ── Routes: Index management ────────────────────────────────────────────────────
 
-@app.delete("/delete-index/{index_name}")
+@app.delete("/delete-index/{index_name}", dependencies=[Depends(require_admin)])
 def delete_index(index_name: str) -> dict:
     """Delete an ES index entirely. Irreversible."""
     r = requests.delete(
@@ -1000,7 +1177,7 @@ def _file_field_for_index(index_name: str) -> str:
     return "source_file"            # grp-manuals, grp-code — mapped as keyword
 
 
-@app.get("/knowledge-base")
+@app.get("/knowledge-base", dependencies=[Depends(current_user)])
 def knowledge_base_summary() -> dict:
     """All indices with doc counts + file list in one call."""
     all_indices = ["grp-manuals", SCRIPTS_INDEX, CODE_INDEX] + RFS_INDICES
@@ -1025,7 +1202,7 @@ def knowledge_base_summary() -> dict:
     return result
 
 
-@app.get("/index-files/{index_name}")
+@app.get("/index-files/{index_name}", dependencies=[Depends(current_user)])
 def list_index_files(index_name: str) -> list[dict]:
     """List unique files indexed in an index with doc counts."""
     field = _file_field_for_index(index_name)
@@ -1040,7 +1217,7 @@ def list_index_files(index_name: str) -> list[dict]:
     return [{"source_file": b["key"], "doc_count": b["doc_count"]} for b in buckets]
 
 
-@app.delete("/delete-file")
+@app.delete("/delete-file", dependencies=[Depends(require_admin)])
 def delete_file_from_index(index_name: str, source_file: str) -> dict:
     """Delete all docs with matching file field from an index."""
     field = _file_field_for_index(index_name)
@@ -1056,7 +1233,7 @@ def delete_file_from_index(index_name: str, source_file: str) -> dict:
     return {"status": "ok", "deleted": deleted, "source_file": source_file}
 
 
-@app.get("/index-files/{index_name}/chunks")
+@app.get("/index-files/{index_name}/chunks", dependencies=[Depends(current_user)])
 def get_file_chunks(index_name: str, source_file: str = Query(...)) -> list[dict]:
     """List individual chunks for a specific source_file in an index."""
     field = _file_field_for_index(index_name)
@@ -1076,7 +1253,7 @@ def get_file_chunks(index_name: str, source_file: str = Query(...)) -> list[dict
     return [{"id": h["_id"], **h["_source"]} for h in hits]
 
 
-@app.post("/reindex/{index_name}")
+@app.post("/reindex/{index_name}", dependencies=[Depends(require_admin)])
 def reindex(index_name: str) -> dict:
     """Re-embed all docs in an index using current embed model. Runs synchronously."""
     r = requests.post(
@@ -1114,7 +1291,7 @@ def reindex(index_name: str) -> dict:
     return {"updated": updated, "errors": errors, "index": index_name}
 
 
-@app.get("/search")
+@app.get("/search", dependencies=[Depends(current_user)])
 def search(q: str = Query(...), index: str = Query(...), size: int = 10) -> list[dict]:
     """Direct BM25 keyword search — no Claude, instant results."""
     all_text_fields = {
@@ -1143,7 +1320,7 @@ def search(q: str = Query(...), index: str = Query(...), size: int = 10) -> list
     return [{"id": h["_id"], "score": round(h["_score"], 4), **h["_source"]} for h in hits]
 
 
-@app.post("/upload-image-bulk")
+@app.post("/upload-image-bulk", dependencies=[Depends(require_admin)])
 async def upload_image_bulk(
     files:   list[UploadFile] = File(...),
     module:  str = Form(...),
@@ -1197,7 +1374,7 @@ async def upload_image_bulk(
     return {"uploaded": uploaded, "errors": errors, "total": len(uploaded)}
 
 
-@app.post("/upload-images-zip")
+@app.post("/upload-images-zip", dependencies=[Depends(require_admin)])
 async def upload_images_zip(file: UploadFile = File(...)) -> dict:
     """Bulk upload images by zip. Extracts into IMG_DIR preserving folder structure.
     Existing files are overwritten (re-upload safe). Path traversal blocked."""
@@ -1244,7 +1421,7 @@ async def upload_images_zip(file: UploadFile = File(...)) -> dict:
     }
 
 
-@app.patch("/section")
+@app.patch("/section", dependencies=[Depends(require_admin)])
 def rename_section(
     module:      str = Query(...),
     old_section: str = Query(...),
@@ -1302,7 +1479,7 @@ def rename_section(
 
 # ── Routes: Document upload ─────────────────────────────────────────────────────
 
-@app.post("/upload-document")
+@app.post("/upload-document", dependencies=[Depends(require_admin)])
 async def upload_document(
     file:     UploadFile = File(...),
     doc_type: str = Form(...),   # manual | rfs | script | code
@@ -1645,8 +1822,6 @@ def _handle_code(content_bytes: bytes, filename: str, meta: dict) -> dict:
 
 # ── Routes: Chat history ────────────────────────────────────────────────────────
 
-import time as _time
-
 class ChatCreate(BaseModel):
     title: str | None = None
 
@@ -1655,12 +1830,42 @@ class ChatUpdate(BaseModel):
     messages: list[dict] | None = None
 
 
+def _owner_filter(user: dict) -> dict | None:
+    """Return ES term filter for the user's owner field, or None for admins (sees all)."""
+    if user.get("role") == "admin":
+        return None
+    return {"term": {"owner": user["email"]}}
+
+
+def _fetch_chat_doc(cid: str) -> dict | None:
+    r = requests.get(f"{ES_URL}/{CHATS_INDEX}/_doc/{cid}",
+                     auth=ES_AUTH, verify=False, timeout=10)
+    if r.status_code != 200:
+        return None
+    return r.json().get("_source", {})
+
+
+def _assert_chat_access(cid: str, user: dict) -> dict:
+    src = _fetch_chat_doc(cid)
+    if src is None:
+        raise HTTPException(404, "Chat not found")
+    if user.get("role") != "admin" and src.get("owner") != user["email"]:
+        # Hide existence: 404, not 403
+        raise HTTPException(404, "Chat not found")
+    return src
+
+
 @app.get("/chats")
-def chats_list() -> list[dict]:
+def chats_list(user: dict = Depends(current_user)) -> list[dict]:
+    query: dict = {"match_all": {}}
+    of = _owner_filter(user)
+    if of is not None:
+        query = {"bool": {"filter": [of]}}
     body = {
+        "query": query,
         "size": 200,
         "sort": [{"updated_at": {"order": "desc"}}],
-        "_source": ["title", "created_at", "updated_at"],
+        "_source": ["title", "owner", "created_at", "updated_at"],
     }
     r = requests.post(f"{ES_URL}/{CHATS_INDEX}/_search",
                       auth=ES_AUTH, verify=False, json=body, timeout=10)
@@ -1671,14 +1876,15 @@ def chats_list() -> list[dict]:
 
 
 @app.post("/chats")
-def chats_create(req: ChatCreate) -> dict:
+def chats_create(req: ChatCreate, user: dict = Depends(current_user)) -> dict:
     cid = uuid.uuid4().hex[:12]
     now = int(_time.time() * 1000)
     doc = {
-        "title": req.title or "New chat",
+        "title":      req.title or "New chat",
+        "owner":      user["email"],
         "created_at": now,
         "updated_at": now,
-        "messages": [],
+        "messages":   [],
     }
     r = requests.put(
         f"{ES_URL}/{CHATS_INDEX}/_doc/{cid}?refresh=wait_for",
@@ -1690,19 +1896,14 @@ def chats_create(req: ChatCreate) -> dict:
 
 
 @app.get("/chats/{cid}")
-def chats_get(cid: str) -> dict:
-    r = requests.get(f"{ES_URL}/{CHATS_INDEX}/_doc/{cid}",
-                     auth=ES_AUTH, verify=False, timeout=10)
-    if r.status_code == 404:
-        raise HTTPException(404, "Chat not found")
-    if r.status_code != 200:
-        raise HTTPException(500, f"Fetch failed: {r.text[:200]}")
-    src = r.json().get("_source", {})
+def chats_get(cid: str, user: dict = Depends(current_user)) -> dict:
+    src = _assert_chat_access(cid, user)
     return {"id": cid, **src}
 
 
 @app.put("/chats/{cid}")
-def chats_update(cid: str, req: ChatUpdate) -> dict:
+def chats_update(cid: str, req: ChatUpdate, user: dict = Depends(current_user)) -> dict:
+    _assert_chat_access(cid, user)
     now = int(_time.time() * 1000)
     doc = {"updated_at": now}
     if req.title is not None:
@@ -1721,7 +1922,8 @@ def chats_update(cid: str, req: ChatUpdate) -> dict:
 
 
 @app.delete("/chats/{cid}")
-def chats_delete(cid: str) -> dict:
+def chats_delete(cid: str, user: dict = Depends(current_user)) -> dict:
+    _assert_chat_access(cid, user)
     r = requests.delete(
         f"{ES_URL}/{CHATS_INDEX}/_doc/{cid}?refresh=wait_for",
         auth=ES_AUTH, verify=False, timeout=10
