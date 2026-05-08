@@ -72,7 +72,71 @@ SAMPLE_QUESTIONS = [
 st.set_page_config(page_title="GRP Support AI", page_icon="🤖", layout="wide")
 
 
-# ── Login gate ────────────────────────────────────────────────────────────────
+# ── Login gate + password reset ───────────────────────────────────────────────
+
+def _render_reset_confirm(token: str):
+    """Shown when the user clicks the email reset link (?reset_token=…)."""
+    st.title("🔑 Set a new password")
+    st.caption("Token from your reset email is loaded. Choose a new password.")
+    with st.form("reset_confirm_form"):
+        pw1 = st.text_input("New password", type="password", autocomplete="new-password")
+        pw2 = st.text_input("Confirm new password", type="password", autocomplete="new-password")
+        ok  = st.form_submit_button("Set password", type="primary", use_container_width=True)
+    if ok:
+        if len(pw1) < 8:
+            st.error("Password must be at least 8 characters")
+            return
+        if pw1 != pw2:
+            st.error("Passwords do not match")
+            return
+        try:
+            r = _orig_req["post"](
+                f"{API_URL}/auth/reset-confirm",
+                json={"token": token, "new_password": pw1}, timeout=10,
+            )
+            if r.status_code == 200:
+                st.success("Password updated. You can now sign in.")
+                # Clear the query param so a refresh doesn't re-trigger the form
+                try:
+                    st.query_params.clear()
+                except Exception:
+                    pass
+                st.session_state.pop("_show_reset_request", None)
+            else:
+                detail = ""
+                try:
+                    detail = r.json().get("detail", "")
+                except Exception:
+                    detail = r.text[:200]
+                st.error(detail or "Reset failed")
+        except Exception as e:
+            st.error(f"Network error: {e}")
+    st.markdown("[Back to sign in](?)")
+
+
+def _render_reset_request():
+    """Shown when user clicks 'Forgot password?' on the login screen."""
+    st.title("🔑 Forgot your password?")
+    st.caption("Enter your email and we'll send a reset link if an account exists.")
+    with st.form("reset_request_form"):
+        email = st.text_input("Email", autocomplete="email")
+        ok    = st.form_submit_button("Send reset link", type="primary", use_container_width=True)
+    if ok:
+        try:
+            r = _orig_req["post"](
+                f"{API_URL}/auth/reset-request",
+                json={"email": email.strip()}, timeout=10,
+            )
+            if r.status_code == 200:
+                st.success("If that email is registered, a reset link is on its way. Check your inbox (and spam folder).")
+            else:
+                st.error("Request failed. Try again or contact your admin.")
+        except Exception as e:
+            st.error(f"Network error: {e}")
+    if st.button("← Back to sign in", key="back_to_login"):
+        st.session_state.pop("_show_reset_request", None)
+        st.rerun()
+
 
 def _render_login():
     st.title("🤖 GRP Support AI")
@@ -107,10 +171,26 @@ def _render_login():
                 st.error(detail or "Login failed")
         except Exception as e:
             st.error(f"Network error: {e}")
+    if st.button("Forgot password?", key="forgot_pw_link"):
+        st.session_state["_show_reset_request"] = True
+        st.rerun()
 
+
+# Query-param reset link from email takes priority over login
+try:
+    _qp_token = st.query_params.get("reset_token")
+except Exception:
+    _qp_token = None
+
+if _qp_token and not st.session_state.get("token"):
+    _render_reset_confirm(_qp_token)
+    st.stop()
 
 if not st.session_state.get("token"):
-    _render_login()
+    if st.session_state.get("_show_reset_request"):
+        _render_reset_request()
+    else:
+        _render_login()
     st.stop()
 
 
