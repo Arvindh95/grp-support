@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Users, Upload, Image as ImageIcon, BarChart3, ArrowLeft, LogOut } from "lucide-react";
+import { Users, Upload, Image as ImageIcon, BarChart3, ArrowLeft, LogOut, Database } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAuth, useRequireAuth } from "@/lib/auth-context";
 import { cn } from "@/lib/utils";
@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 const NAV = [
   { href: "/admin/users/", label: "Users", icon: Users },
   { href: "/admin/upload/", label: "Upload Documents", icon: Upload },
+  { href: "/admin/knowledge/", label: "Knowledge Base", icon: Database },
   { href: "/admin/images/", label: "Image Manager", icon: ImageIcon },
   { href: "/admin/audit/", label: "Audit & Usage", icon: BarChart3 },
 ];
