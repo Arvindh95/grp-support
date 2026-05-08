@@ -21,6 +21,15 @@ export async function deleteChat(id: string) {
   return api(`/chats/${id}`, { method: "DELETE" });
 }
 
+// Upload a single file as a one-shot attachment for the next /query.
+// Returns { path, name, size } where `path` is the server-side path that the
+// /query endpoint reads via attached_files[].
+export async function uploadChatFile(file: File): Promise<{ path: string; name: string; size: number }> {
+  const fd = new FormData();
+  fd.append("file", file);
+  return api("/upload-chat-file", { method: "POST", body: fd });
+}
+
 // ── Streaming /query/stream consumer ──────────────────────────────────────────
 
 export type StreamEvent =

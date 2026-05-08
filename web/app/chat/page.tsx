@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Composer } from "@/components/chat/composer";
+import { Composer, type Attachment } from "@/components/chat/composer";
 import { MessageBubble } from "@/components/chat/message";
 import { getChat, updateChat, streamQuery, createChat } from "@/lib/chat-api";
 import type { Message } from "@/lib/chat-types";
@@ -63,7 +63,7 @@ export default function ChatPage() {
     [messages],
   );
 
-  async function send(text: string) {
+  async function send(text: string, attached: Attachment[] = []) {
     setBusy(true);
 
     // Ensure we have a chat to write into
@@ -79,7 +79,12 @@ export default function ChatPage() {
       }
     }
 
-    const userMsg: Message = { role: "user", content: text };
+    const userTextWithAttachments =
+      attached.length > 0
+        ? `${text}\n\n_📎 Attached: ${attached.map((a) => a.name).join(", ")}_`
+        : text;
+
+    const userMsg: Message = { role: "user", content: userTextWithAttachments };
     const pendingMsg: Message = { role: "assistant", content: "", pending: true, tool_calls: [] };
     setMessages((prev) => [...prev, userMsg, pendingMsg]);
 
@@ -91,8 +96,9 @@ export default function ChatPage() {
     try {
       for await (const ev of streamQuery({
         question: text,
-        history: histForCall.slice(-10),  // last 10 turns
+        history: histForCall.slice(-10),
         include_images: true,
+        attached_files: attached.map((a) => a.path),
       })) {
         if (ev.type === "delta") {
           accumulated += ev.text;
