@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Loader2, Search, AlertCircle } from "lucide-react";
@@ -7,7 +8,23 @@ import { SourcesBlock } from "./sources";
 import { ImageGallery } from "./images";
 import type { Message } from "@/lib/chat-types";
 
+// Old chats persisted image URLs pointing at the legacy http://...:8080 host
+// (port now closed, also blocked as mixed-content under HTTPS). The HMAC sig
+// is path-only, so rewriting host+port keeps the signature valid.
+const LEGACY_IMG_RE = /https?:\/\/173\.212\.247\.3:8080\//g;
+const NEW_IMG_BASE = "https://173.212.247.3.nip.io/images/";
+
+function rewriteLegacyImageUrls(s: string): string {
+  return s.replace(LEGACY_IMG_RE, NEW_IMG_BASE);
+}
+
 export function MessageBubble({ msg }: { msg: Message }) {
+  const content = useMemo(() => rewriteLegacyImageUrls(msg.content || ""), [msg.content]);
+  const images = useMemo(
+    () => msg.images?.map((im) => ({ ...im, url: rewriteLegacyImageUrls(im.url) })),
+    [msg.images],
+  );
+
   if (msg.role === "user") {
     return (
       <div className="flex justify-end">
@@ -42,12 +59,12 @@ export function MessageBubble({ msg }: { msg: Message }) {
                 ))}
               </div>
             )}
-            {msg.content ? (
+            {content ? (
               <div className="prose prose-sm max-w-none dark:prose-invert
                               prose-headings:mt-3 prose-headings:mb-2
                               prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-0
                               prose-img:my-2 prose-img:rounded prose-img:border">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
               </div>
             ) : msg.pending ? (
               <div className="flex items-center gap-2 text-muted-foreground">
@@ -59,7 +76,7 @@ export function MessageBubble({ msg }: { msg: Message }) {
               <p className="text-[11px] text-muted-foreground mt-2">{msg.context_used} chunks retrieved</p>
             ) : null}
             {msg.sources && msg.sources.length > 0 && <SourcesBlock sources={msg.sources} />}
-            {msg.images && msg.images.length > 0 && <ImageGallery images={msg.images} />}
+            {images && images.length > 0 && <ImageGallery images={images} />}
           </div>
         )}
       </div>
