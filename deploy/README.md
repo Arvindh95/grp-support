@@ -7,7 +7,6 @@ Mirrors live VPS state. Update these files when you change anything on the host.
 | File | Lives on host as | Purpose |
 |---|---|---|
 | `systemd/grp-api.service` | `/etc/systemd/system/grp-api.service` | FastAPI on `:8000`, 4 workers |
-| `systemd/grp-chat.service` | `/etc/systemd/system/grp-chat.service` | Streamlit on `:8501` (legacy, optional) |
 | `nginx/grp-chat-tls` | `/etc/nginx/sites-available/grp-chat-tls` | HTTPS vhost (:443 + :80 redirect): React + `/api/` proxy + `/images/` proxy |
 | `bootstrap.sh` | — | Idempotent fresh-host installer |
 

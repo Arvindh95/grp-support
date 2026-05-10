@@ -350,9 +350,6 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://173.212.247.3.nip.io",  # production HTTPS via nip.io
-        "http://127.0.0.1:8501",
-        "http://localhost:8501",
-        "http://173.212.247.3:8081",     # legacy HTTP (kept during cutover)
         "http://localhost:3000",          # Next.js dev server
     ],
     allow_methods=["*"],

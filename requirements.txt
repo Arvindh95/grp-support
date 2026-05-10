@@ -1,5 +1,4 @@
-# Frontend (grp_chat.py — Streamlit on :8501)
-streamlit
+# Backend support libs
 requests
 urllib3
 pandas

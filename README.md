@@ -1,14 +1,14 @@
 # grp-support
 
-GRP Support AI — Streamlit chat over GRP manuals, RFS tickets, scripts, code.
+GRP Support AI — Next.js chat over GRP manuals, RFS tickets, scripts, code.
 JWT-authenticated, multi-user, with audit log + cost dashboard.
 
 ## Layout
 
 | File | Role | Runs as |
 |---|---|---|
-| `grp_chat.py` | Streamlit frontend | `grp-chat.service` → `:8501` (proxied at nginx `:8081`) |
-| `api_server.py` | FastAPI backend (Claude-as-agent + ES/Ollama) | `grp-api.service` → `:8000` |
+| `web/` | Next.js 16 React frontend (static export) | nginx serves `/opt/grp-chat-web` on `:443` |
+| `api_server.py` | FastAPI backend (Claude-as-agent + ES/Ollama) | `grp-api.service` → `:8000`, proxied at `/api/` |
 | `bootstrap_admin.py` | One-shot: seed initial admin user | manual run |
 | `load_manuals.py` | Loader: chunk + embed manuals → `grp-manuals` index | manual run |
 | `load_rfs_embed.py` | Loader: RFS tickets `.xls` → monthly indices | manual run |
@@ -18,8 +18,8 @@ JWT-authenticated, multi-user, with audit log + cost dashboard.
 
 ## VPS deploy
 
-Working tree on VPS: `/opt/grp-chat`. Both `grp-api` and `grp-chat` services
-load env vars from `/etc/grp-api.env`.
+Working tree on VPS: `/opt/grp-chat`. The `grp-api` service loads env vars
+from `/etc/grp-api.env`. Built frontend lives in `/opt/grp-chat-web`.
 
 Backend depends on Elasticsearch (`:9200`), Ollama (`:11434`, `bge-m3`),
 Anthropic API (`anthropic` SDK). Image files live under `/opt/grp-manuals/Doc-Images`

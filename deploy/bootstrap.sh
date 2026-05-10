@@ -39,7 +39,6 @@ cd "$REPO"
 
 echo "── 5. systemd units ──"
 install -m 644 deploy/systemd/grp-api.service /etc/systemd/system/
-install -m 644 deploy/systemd/grp-chat.service /etc/systemd/system/
 systemctl daemon-reload
 
 echo "── 6. TLS cert (Let's Encrypt via nip.io) ──"
@@ -73,7 +72,6 @@ echo "── 8. start backend ──"
 chmod 600 /etc/grp-api.env
 chown root:root /etc/grp-api.env
 systemctl enable --now grp-api
-# systemctl enable --now grp-chat   # uncomment if you want Streamlit too
 
 echo "── 9. bootstrap admin (one-time) ──"
 echo "   Run manually: ADMIN_EMAIL=you@example.com ADMIN_PASSWORD='ChangeMe123' \\"
