@@ -1178,11 +1178,6 @@ def get_embedding(text: str) -> list[float]:
     return r.json()["embedding"]
 
 
-def _slugify(text: str, max_len: int = 30) -> str:
-    s = re.sub(r'[^a-zA-Z0-9]+', '_', text.lower()).strip('_')
-    return s[:max_len]
-
-
 # ── Loader Helpers (from load_manuals.py / load_scripts.py / load_rfs_embed.py) ─
 
 def _extract_module_name(filename: str) -> str:
@@ -1201,7 +1196,10 @@ def _extract_images_and_captions(text: str) -> tuple[list[str], list[str]]:
     lines = text.split('\n')
     seen = set()
     for i, line in enumerate(lines):
-        img_match = re.search(r'!\[.*?\]\(.*?/(.*?)\)', line)
+        img_match = re.search(
+            r'!\[.*?\]\((?:.*?Images/|https?://[^/)]+/)(.+?)\)',
+            line,
+        )
         if img_match:
             fname = img_match.group(1)
             if fname not in seen:
@@ -1972,52 +1970,6 @@ def query_stream(req: QueryRequest, user: dict = Depends(current_user)):
                              media_type="text/event-stream")
 
 
-# ── Routes: Module / Section lookup ────────────────────────────────────────────
-
-@app.get("/modules", dependencies=[Depends(current_user)])
-def get_modules() -> list[str]:
-    r = requests.post(
-        f"{ES_URL}/grp-manuals/_search",
-        auth=ES_AUTH, verify=False, timeout=10,
-        json={"size": 0, "aggs": {"mods": {"terms": {"field": "module", "size": 100}}}}
-    )
-    buckets = r.json().get("aggregations", {}).get("mods", {}).get("buckets", [])
-    return sorted(b["key"] for b in buckets)
-
-
-@app.get("/sections", dependencies=[Depends(current_user)])
-def get_sections(module: str = Query(...)) -> list[str]:
-    r = requests.post(
-        f"{ES_URL}/grp-manuals/_search",
-        auth=ES_AUTH, verify=False, timeout=10,
-        json={
-            "size": 0,
-            "query": {"term": {"module": module}},
-            "aggs": {"secs": {"terms": {"field": "section.keyword", "size": 300}}}
-        }
-    )
-    buckets = r.json().get("aggregations", {}).get("secs", {}).get("buckets", [])
-    return sorted(b["key"] for b in buckets)
-
-
-@app.get("/section-images", dependencies=[Depends(current_user)])
-def get_section_images(module: str = Query(...), section: str = Query(...)) -> dict:
-    doc_id, src = _find_section_doc(module, section)
-    if not src:
-        return {"doc_id": None, "images": []}
-    img_list = src.get("images", [])
-    cap_list = src.get("image_captions", [])
-    images = []
-    for i, fname in enumerate(img_list):
-        img_path = fname.replace("Doc-Images/", "", 1)
-        images.append({
-            "filename": fname,
-            "url": _sign_image(img_path),
-            "caption": cap_list[i] if i < len(cap_list) else ""
-        })
-    return {"doc_id": doc_id, "images": images}
-
-
 # ── Routes: Chat file upload (one-shot, Claude reads at query time) ────────────
 
 @app.post("/upload-chat-file", dependencies=[Depends(current_user)])
@@ -2046,92 +1998,6 @@ async def upload_chat_file(file: UploadFile = File(...)) -> dict:
             raise HTTPException(status_code=500, detail=f"DOCX conversion failed: {e}")
 
     return {"path": saved, "name": file.filename, "size": len(data)}
-
-
-# ── Routes: Image upload / delete ──────────────────────────────────────────────
-
-@app.post("/upload-image", dependencies=[Depends(require_admin)])
-async def upload_image(
-    file:    UploadFile = File(...),
-    module:  str = Form(...),
-    section: str = Form(...),
-    caption: str = Form(""),
-) -> dict:
-    # Validate image type
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-        raise HTTPException(400, "Only PNG/JPG/JPEG/GIF/WEBP allowed")
-
-    # Build filename
-    mod_slug = _slugify(module, 20)
-    sec_slug = _slugify(section, 30)
-    uid = uuid.uuid4().hex[:8]
-    filename = f"{mod_slug}_{sec_slug}_{uid}{ext}"
-    dest_path = os.path.join(IMG_DIR, filename)
-
-    # Save to disk
-    contents = await file.read()
-    with open(dest_path, "wb") as f:
-        f.write(contents)
-
-    # Find ES doc and patch arrays via Painless script
-    doc_id, _ = _find_section_doc(module, section)
-    if not doc_id:
-        os.remove(dest_path)
-        raise HTTPException(404, f"Section '{section}' not found in module '{module}'")
-
-    script = {
-        "script": {
-            "source": (
-                "if (ctx._source.images == null) { ctx._source.images = []; }"
-                "ctx._source.images.add(params.fname);"
-                "if (ctx._source.image_captions == null) { ctx._source.image_captions = []; }"
-                "ctx._source.image_captions.add(params.cap);"
-            ),
-            "params": {"fname": filename, "cap": caption}
-        }
-    }
-    r = requests.post(
-        f"{ES_URL}/grp-manuals/_update/{doc_id}",
-        auth=ES_AUTH, verify=False, json=script, timeout=10
-    )
-    if r.status_code not in (200, 201):
-        raise HTTPException(500, f"ES update failed: {r.text[:200]}")
-
-    return {"status": "ok", "filename": filename, "url": _sign_image(filename)}
-
-
-@app.delete("/delete-image", dependencies=[Depends(require_admin)])
-def delete_image(module: str, section: str, filename: str) -> dict:
-    doc_id, _ = _find_section_doc(module, section)
-    if not doc_id:
-        raise HTTPException(404, f"Section '{section}' not found")
-
-    script = {
-        "script": {
-            "source": (
-                "int i = ctx._source.images.indexOf(params.fname);"
-                "if (i >= 0) {"
-                "  ctx._source.images.remove(i);"
-                "  if (ctx._source.image_captions != null && ctx._source.image_captions.size() > i) {"
-                "    ctx._source.image_captions.remove(i);"
-                "  }"
-                "}"
-            ),
-            "params": {"fname": filename}
-        }
-    }
-    requests.post(f"{ES_URL}/grp-manuals/_update/{doc_id}",
-                  auth=ES_AUTH, verify=False, json=script, timeout=10)
-
-    # Delete file from disk
-    dest_path = os.path.join(IMG_DIR, filename.replace("Doc-Images/", ""))
-    try:
-        os.remove(dest_path)
-    except FileNotFoundError:
-        pass
-
-    return {"status": "ok", "filename": filename}
 
 
 # ── Routes: Index management ────────────────────────────────────────────────────
@@ -2301,107 +2167,6 @@ def search(q: str = Query(...), index: str = Query(...), size: int = 10) -> list
         raise HTTPException(500, r.text[:200])
     hits = r.json().get("hits", {}).get("hits", [])
     return [{"id": h["_id"], "score": round(h["_score"], 4), **h["_source"]} for h in hits]
-
-
-@app.post("/upload-image-bulk", dependencies=[Depends(require_admin)])
-async def upload_image_bulk(
-    files:   list[UploadFile] = File(...),
-    module:  str = Form(...),
-    section: str = Form(...),
-    captions: str = Form("[]"),   # JSON array of captions, positionally matched
-) -> dict:
-    """Upload multiple images to a section at once."""
-    try:
-        cap_list = json.loads(captions)
-    except Exception:
-        cap_list = []
-
-    doc_id, _ = _find_section_doc(module, section)
-    if not doc_id:
-        raise HTTPException(404, f"Section '{section}' not found in module '{module}'")
-
-    uploaded = []
-    errors = []
-    for i, file in enumerate(files):
-        ext = os.path.splitext(file.filename)[1].lower()
-        if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-            errors.append(f"{file.filename}: unsupported type")
-            continue
-        mod_slug = _slugify(module, 20)
-        sec_slug = _slugify(section, 30)
-        uid = uuid.uuid4().hex[:8]
-        filename = f"{mod_slug}_{sec_slug}_{uid}{ext}"
-        dest_path = os.path.join(IMG_DIR, filename)
-        caption = cap_list[i] if i < len(cap_list) else ""
-        try:
-            contents = await file.read()
-            with open(dest_path, "wb") as f:
-                f.write(contents)
-            script = {
-                "script": {
-                    "source": (
-                        "if (ctx._source.images == null) { ctx._source.images = []; }"
-                        "ctx._source.images.add(params.fname);"
-                        "if (ctx._source.image_captions == null) { ctx._source.image_captions = []; }"
-                        "ctx._source.image_captions.add(params.cap);"
-                    ),
-                    "params": {"fname": filename, "cap": caption}
-                }
-            }
-            requests.post(f"{ES_URL}/grp-manuals/_update/{doc_id}",
-                          auth=ES_AUTH, verify=False, json=script, timeout=10)
-            uploaded.append({"filename": filename, "url": _sign_image(filename), "caption": caption})
-        except Exception as e:
-            errors.append(f"{file.filename}: {e}")
-
-    return {"uploaded": uploaded, "errors": errors, "total": len(uploaded)}
-
-
-@app.post("/upload-images-zip", dependencies=[Depends(require_admin)])
-async def upload_images_zip(file: UploadFile = File(...)) -> dict:
-    """Bulk upload images by zip. Extracts into IMG_DIR preserving folder structure.
-    Existing files are overwritten (re-upload safe). Path traversal blocked."""
-    if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(400, "Only .zip files accepted")
-
-    import zipfile
-    data = await file.read()
-    allowed_ext = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
-    extracted, skipped = 0, 0
-    skipped_names = []
-    img_dir_abs = os.path.abspath(IMG_DIR)
-
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(data))
-    except zipfile.BadZipFile:
-        raise HTTPException(400, "Not a valid zip file")
-
-    with zf:
-        for member in zf.namelist():
-            if member.endswith("/"):
-                continue
-            safe = member.replace("\\", "/").lstrip("/")
-            ext = os.path.splitext(safe)[1].lower()
-            if ext not in allowed_ext:
-                skipped += 1
-                skipped_names.append(safe)
-                continue
-            target = os.path.abspath(os.path.join(IMG_DIR, safe))
-            if not target.startswith(img_dir_abs + os.sep) and target != img_dir_abs:
-                skipped += 1
-                skipped_names.append(f"{safe} (path traversal blocked)")
-                continue
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            with zf.open(member) as src, open(target, "wb") as dst:
-                dst.write(src.read())
-            extracted += 1
-
-    return {
-        "extracted": extracted,
-        "skipped": skipped,
-        "skipped_examples": skipped_names[:10],
-        "img_dir": IMG_DIR,
-    }
 
 
 @app.patch("/section", dependencies=[Depends(require_admin)])

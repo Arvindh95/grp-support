@@ -9,11 +9,10 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Alert } from "@/components/ui/alert";
 import { api, API_URL, getToken } from "@/lib/api";
 
-type DocType = "manual" | "rfs" | "script" | "code" | "images_zip";
+type DocType = "manual" | "rfs" | "script" | "code";
 
 const TYPE_LABEL: Record<DocType, string> = {
   manual: "Manual (.docx / .md)",
-  images_zip: "Manual Images (.zip)",
   rfs: "RFS Tickets (.xlsx / .csv)",
   script: "SQL Script (.txt)",
   code: "Code (.py / .cs / .sql)",
@@ -21,7 +20,6 @@ const TYPE_LABEL: Record<DocType, string> = {
 
 const ACCEPT: Record<DocType, string> = {
   manual: ".docx,.md",
-  images_zip: ".zip",
   rfs: ".xlsx,.csv,.xls",
   script: ".txt,.sql",
   code: ".py,.cs,.sql",
@@ -29,7 +27,6 @@ const ACCEPT: Record<DocType, string> = {
 
 const META_LABEL: Record<DocType, string> = {
   manual: "Module name (optional — auto-detected from filename)",
-  images_zip: "",
   rfs: "Target index (optional — auto-detected from timestamps)",
   script: "Purpose (optional)",
   code: "Purpose (optional)",
@@ -61,18 +58,13 @@ export default function UploadPage() {
     const fd = new FormData();
     fd.append("file", file);
 
-    let url: string;
-    if (docType === "images_zip") {
-      url = `${API_URL}/upload-images-zip`;
-    } else {
-      url = `${API_URL}/upload-document`;
-      fd.append("doc_type", docType);
-      const m: Record<string, unknown> = { confirm: true };
-      if (docType === "manual" && meta.trim()) m.module = meta.trim();
-      if (docType === "rfs" && meta.trim()) m.index = meta.trim();
-      if ((docType === "script" || docType === "code") && meta.trim()) m.purpose = meta.trim();
-      fd.append("metadata", JSON.stringify(m));
-    }
+    const url = `${API_URL}/upload-document`;
+    fd.append("doc_type", docType);
+    const m: Record<string, unknown> = { confirm: true };
+    if (docType === "manual" && meta.trim()) m.module = meta.trim();
+    if (docType === "rfs" && meta.trim()) m.index = meta.trim();
+    if ((docType === "script" || docType === "code") && meta.trim()) m.purpose = meta.trim();
+    fd.append("metadata", JSON.stringify(m));
 
     try {
       const res = await fetch(url, {
@@ -91,13 +83,6 @@ export default function UploadPage() {
         return { filename: file.name, ok: false, detail };
       }
       const j = (await res.json()) as Record<string, unknown>;
-      if (docType === "images_zip") {
-        return {
-          filename: file.name,
-          ok: true,
-          detail: `extracted ${j.extracted ?? 0}, skipped ${j.skipped ?? 0}`,
-        };
-      }
       return {
         filename: file.name,
         ok: true,
@@ -125,7 +110,7 @@ export default function UploadPage() {
     setBusy(false);
   }
 
-  const single = docType === "rfs" || docType === "script" || docType === "code" || docType === "images_zip";
+  const single = docType === "rfs" || docType === "script" || docType === "code";
 
   return (
     <div className="space-y-6">

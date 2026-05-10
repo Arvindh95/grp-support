@@ -1,6 +1,6 @@
 """
 GRP Support AI Chat — Streamlit Frontend
-Tabs: Chat | Image Manager | Upload Documents
+Tabs: Chat | Upload Documents
 Run: streamlit run grp_chat.py
 """
 
@@ -326,7 +326,7 @@ with st.sidebar:
     st.divider()
 
     _is_admin = (st.session_state.get("user", {}) or {}).get("role") == "admin"
-    _pages = ["💬 Chat", "🖼 Image Manager", "📤 Upload Documents"]
+    _pages = ["💬 Chat", "📤 Upload Documents"]
     if _is_admin:
         _pages.append("👥 Users")
     page = st.radio(
@@ -718,99 +718,7 @@ if page == "💬 Chat":
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — IMAGE MANAGER
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "🖼 Image Manager":
-    st.header("Manual Image Manager")
-    st.caption("Upload or remove screenshots linked to manual sections")
-
-    col_left, col_right = st.columns([1, 2])
-
-    with col_left:
-        # Module selector
-        modules = api_get("/modules") or []
-        if not modules:
-            st.warning("Could not load modules from API")
-        else:
-            selected_module = st.selectbox("Module", modules, key="img_module")
-
-            # Section selector filtered by module
-            sections = api_get("/sections", {"module": selected_module}) or []
-            if sections:
-                selected_section = st.selectbox("Section", sections, key="img_section")
-
-                st.divider()
-                st.subheader("Upload New Image")
-                uploaded_img = st.file_uploader(
-                    "Choose image", type=["png", "jpg", "jpeg", "gif", "webp"],
-                    key="img_upload"
-                )
-                caption_input = st.text_input("Caption (optional)", key="img_caption")
-
-                if st.button("Upload Image", type="primary", disabled=uploaded_img is None):
-                    with st.spinner("Uploading..."):
-                        try:
-                            resp = requests.post(
-                                f"{API_URL}/upload-image",
-                                files={"file": (uploaded_img.name, uploaded_img.getvalue(),
-                                                uploaded_img.type)},
-                                data={"module": selected_module,
-                                      "section": selected_section,
-                                      "caption": caption_input},
-                                timeout=30
-                            )
-                            if resp.status_code == 200:
-                                st.success(f"Uploaded: {resp.json()['filename']}")
-                                st.rerun()
-                            else:
-                                st.error(f"Upload failed: {resp.json().get('detail', resp.text[:100])}")
-                        except Exception as e:
-                            st.error(f"Error: {e}")
-            else:
-                st.info("No sections found for this module")
-
-    with col_right:
-        if modules and sections:
-            st.subheader(f"Images in: {clean_text(selected_section)}")
-            section_data = api_get("/section-images",
-                                   {"module": selected_module, "section": selected_section})
-
-            if section_data and section_data.get("images"):
-                imgs = section_data["images"]
-                st.caption(f"{len(imgs)} image(s)")
-                for img in imgs:
-                    img_col, del_col = st.columns([4, 1])
-                    with img_col:
-                        try:
-                            st.image(img["url"], use_container_width=True)
-                            caption = img.get("caption", "")
-                            st.caption(caption if caption else "_no caption_")
-                        except Exception:
-                            st.caption(f"[{img['filename']} — unavailable]")
-                    with del_col:
-                        if st.button("🗑", key=f"del_{img['filename']}",
-                                     help="Delete this image"):
-                            try:
-                                resp = requests.delete(
-                                    f"{API_URL}/delete-image",
-                                    params={"module": selected_module,
-                                            "section": selected_section,
-                                            "filename": img["filename"]},
-                                    timeout=15
-                                )
-                                if resp.status_code == 200:
-                                    st.success("Deleted")
-                                    st.rerun()
-                                else:
-                                    st.error(f"Delete failed: {resp.text[:100]}")
-                            except Exception as e:
-                                st.error(f"Error: {e}")
-            else:
-                st.info("No images for this section yet. Upload one on the left.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — UPLOAD DOCUMENTS
+# TAB 2 — UPLOAD DOCUMENTS
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "📤 Upload Documents":
     st.header("Upload & Index Documents")
@@ -818,7 +726,7 @@ elif page == "📤 Upload Documents":
 
     doc_type = st.selectbox(
         "Document Type",
-        ["Manual (.docx / .md)", "Manual Images (.zip)", "RFS Tickets (.xlsx / .csv)", "SQL Script (.txt)", "Code (.py / .cs / .sql)"],
+        ["Manual (.docx / .md)", "RFS Tickets (.xlsx / .csv)", "SQL Script (.txt)", "Code (.py / .cs / .sql)"],
         key="doc_type_select"
     )
 
@@ -957,39 +865,6 @@ elif page == "📤 Upload Documents":
                     if st.button("✖ Cancel", key="manual_cancel"):
                         del st.session_state["manual_preview_data"]
                         st.rerun()
-
-    # ── MANUAL IMAGES (ZIP) ─────────────────────────────────────────────────
-    elif doc_type == "Manual Images (.zip)":
-        st.subheader("Bulk Upload Manual Screenshots")
-        st.caption(
-            "Zip your local Images/ folder (with per-module subfolders inside) and upload here. "
-            "Files extract to /opt/grp-manuals/Doc-Images/ preserving folders. Re-upload overwrites existing."
-        )
-        zip_file = st.file_uploader("Upload images .zip", type=["zip"], key="img_zip_file")
-        if zip_file:
-            st.info(f"Selected: {zip_file.name} — {zip_file.size / 1024 / 1024:.1f} MB")
-            if st.button("📦 Extract & Upload", type="primary", key="img_zip_go"):
-                with st.spinner("Uploading and extracting..."):
-                    try:
-                        resp = requests.post(
-                            f"{API_URL}/upload-images-zip",
-                            files={"file": (zip_file.name, zip_file.getvalue(), "application/zip")},
-                            timeout=600,
-                        )
-                        if resp.status_code == 200:
-                            r = resp.json()
-                            st.success(
-                                f"Extracted {r['extracted']} image(s) → {r['img_dir']}. "
-                                f"Skipped: {r['skipped']}."
-                            )
-                            if r.get("skipped_examples"):
-                                with st.expander("Skipped files"):
-                                    for name in r["skipped_examples"]:
-                                        st.code(name)
-                        else:
-                            st.error(f"Error: {resp.json().get('detail', resp.text[:200])}")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
 
     # ── RFS TICKETS ──────────────────────────────────────────────────────────
     elif doc_type == "RFS Tickets (.xlsx / .csv)":
