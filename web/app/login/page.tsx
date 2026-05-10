@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/alert";
-import { api, setSession } from "@/lib/api";
+import { api, getUser, setSession } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 
 type LoginResponse = {
@@ -25,6 +25,12 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  // If a session cookie is already present (e.g. user has another tab open),
+  // skip the form and go straight to /chat/.
+  useEffect(() => {
+    if (getUser()) router.replace("/chat/");
+  }, [router]);
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
