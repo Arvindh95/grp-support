@@ -22,9 +22,10 @@ export async function deleteChat(id: string) {
 }
 
 // Upload a single file as a one-shot attachment for the next /query.
-// Returns { path, name, size } where `path` is the server-side path that the
-// /query endpoint reads via attached_files[].
-export async function uploadChatFile(file: File): Promise<{ path: string; name: string; size: number }> {
+// Returns { id, name, size } where `id` is an opaque HMAC-signed token bound
+// to the uploading user. /query reads it via attached_files[] and resolves
+// it back to a server path while enforcing owner.
+export async function uploadChatFile(file: File): Promise<{ id: string; name: string; size: number }> {
   const fd = new FormData();
   fd.append("file", file);
   return api("/upload-chat-file", { method: "POST", body: fd });

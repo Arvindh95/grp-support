@@ -100,7 +100,7 @@ export default function ChatPage() {
         question: text,
         history: histForCall.slice(-10),
         include_images: true,
-        attached_files: attached.map((a) => a.path),
+        attached_files: attached.map((a) => a.id),
       })) {
         if (ev.type === "delta") {
           accumulated += ev.text;

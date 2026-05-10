@@ -31,13 +31,17 @@ export function getUser(): User | null {
 
 export function setSession(token: string, user: User, hours = 12) {
   const exp = new Date(Date.now() + hours * 3600 * 1000).toUTCString();
-  document.cookie = `${TOKEN_COOKIE}=${encodeURIComponent(token)}; path=/; expires=${exp}; SameSite=Lax`;
-  document.cookie = `${USER_COOKIE}=${encodeURIComponent(JSON.stringify(user))}; path=/; expires=${exp}; SameSite=Lax`;
+  // `Secure` only sent when page itself is served over HTTPS — keeps localhost
+  // dev (http://localhost:3000) working while production sets it.
+  const secure = typeof window !== "undefined" && window.location.protocol === "https:" ? "; Secure" : "";
+  document.cookie = `${TOKEN_COOKIE}=${encodeURIComponent(token)}; path=/; expires=${exp}; SameSite=Lax${secure}`;
+  document.cookie = `${USER_COOKIE}=${encodeURIComponent(JSON.stringify(user))}; path=/; expires=${exp}; SameSite=Lax${secure}`;
 }
 
 export function clearSession() {
-  document.cookie = `${TOKEN_COOKIE}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT`;
-  document.cookie = `${USER_COOKIE}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+  const secure = typeof window !== "undefined" && window.location.protocol === "https:" ? "; Secure" : "";
+  document.cookie = `${TOKEN_COOKIE}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax${secure}`;
+  document.cookie = `${USER_COOKIE}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax${secure}`;
 }
 
 export class ApiError extends Error {

@@ -26,7 +26,6 @@ export default function UsersPage() {
   // Create form state
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
-  const [pw, setPw] = useState("");
   const [role, setRole] = useState("user");
   const [creating, setCreating] = useState(false);
 
@@ -52,20 +51,19 @@ export default function UsersPage() {
     e.preventDefault();
     setError(null);
     setOkMsg(null);
-    if (!email.trim() || pw.length < 8) {
-      setError("Email + password (≥8 chars) required.");
+    if (!email.trim()) {
+      setError("Email required.");
       return;
     }
     setCreating(true);
     try {
       await api("/auth/register", {
         method: "POST",
-        body: JSON.stringify({ email: email.trim(), name: name.trim(), password: pw, role }),
+        body: JSON.stringify({ email: email.trim(), name: name.trim(), role }),
       });
-      setOkMsg(`Created ${email}. Welcome email sent if SMTP is configured.`);
+      setOkMsg(`Created ${email}. Setup link emailed (valid 24h) — user picks their own password.`);
       setEmail("");
       setName("");
-      setPw("");
       setRole("user");
       await refresh();
     } catch (e) {
@@ -137,10 +135,6 @@ export default function UsersPage() {
             <div className="space-y-2">
               <Label>Name (optional)</Label>
               <Input value={name} onChange={(e) => setName(e.target.value)} />
-            </div>
-            <div className="space-y-2">
-              <Label>Initial password (≥8 chars)</Label>
-              <Input type="password" value={pw} onChange={(e) => setPw(e.target.value)} required />
             </div>
             <div className="space-y-2">
               <Label>Role</Label>

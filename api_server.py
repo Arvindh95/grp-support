@@ -61,6 +61,15 @@ CHAT_UPLOAD_DIR = os.environ.get("CHAT_UPLOAD_DIR", "/tmp/grp-chat")
 os.makedirs(CHAT_UPLOAD_DIR, exist_ok=True)
 CHAT_UPLOAD_EXTS = {".pdf", ".md", ".txt", ".docx", ".png", ".jpg", ".jpeg", ".webp", ".csv"}
 CHAT_UPLOAD_MAX_BYTES = 25 * 1024 * 1024
+DOCUMENT_UPLOAD_MAX_BYTES = int(os.environ.get("DOCUMENT_UPLOAD_MAX_BYTES",
+                                                str(30 * 1024 * 1024)))
+# Per-doc-type allowed extensions for /upload-document.
+DOCUMENT_UPLOAD_EXTS = {
+    "manual": {".docx", ".md"},
+    "rfs":    {".xlsx", ".xls", ".csv"},
+    "script": {".txt", ".sql"},
+    "code":   {".py", ".cs", ".sql"},
+}
 
 RFS_INDICES = [
     "rfs-tickets-jan-2025",
@@ -340,11 +349,11 @@ app = FastAPI(title="GRP Support AI API", version="3.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://173.212.247.3.nip.io",  # production HTTPS via nip.io
         "http://127.0.0.1:8501",
         "http://localhost:8501",
-        "http://173.212.247.3:8081",
-        "http://173.212.247.3:8083",  # Next.js static export served by nginx
-        "http://localhost:3000",       # Next.js dev server
+        "http://173.212.247.3:8081",     # legacy HTTP (kept during cutover)
+        "http://localhost:3000",          # Next.js dev server
     ],
     allow_methods=["*"],
     allow_headers=["*"],
@@ -445,6 +454,33 @@ def make_token(email: str, role: str, token_version: int = 0) -> str:
     return _jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
 
+# ── Opaque upload tokens (HMAC-signed) ────────────────────────────────────────
+# /upload-chat-file returns one of these instead of a server filesystem path,
+# so a leaked path can't be exfiltrated by another authenticated user.
+def _make_upload_token(path: str, owner: str, ttl: int = 86400) -> str:
+    payload = {
+        "p":   path,
+        "o":   owner,
+        "exp": int(_time.time()) + ttl,
+    }
+    return _jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+def _resolve_upload_token(token: str, owner: str) -> str:
+    try:
+        payload = _jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except _jwt.PyJWTError:
+        raise HTTPException(403, "Invalid or expired upload token")
+    if payload.get("o") != owner:
+        raise HTTPException(403, "Upload token owner mismatch")
+    p = payload.get("p", "")
+    abs_p   = os.path.abspath(p)
+    abs_dir = os.path.abspath(CHAT_UPLOAD_DIR)
+    if not abs_p.startswith(abs_dir + os.sep):
+        raise HTTPException(403, "Upload path outside chat upload dir")
+    return p
+
+
 def _bump_token_version(email: str) -> None:
     """Invalidate all existing JWTs for this user (called on pw change/reset)."""
     requests.post(
@@ -516,9 +552,11 @@ class LoginReq(BaseModel):
 
 class RegisterReq(BaseModel):
     email:    str
-    password: str
     name:     str = ""
     role:     str = "user"
+    # `password` accepted for back-compat but ignored — admin-created accounts
+    # always get a one-time setup link instead of a cleartext password email.
+    password: str | None = None
 
 
 @app.post("/auth/login")
@@ -547,9 +585,12 @@ def auth_register(req: RegisterReq) -> dict:
     if get_user_by_email(req.email):
         raise HTTPException(409, "User already exists")
     role = req.role if req.role in ("user", "admin") else "user"
+    # Provision with a strong random placeholder; user must use the setup link
+    # below to choose their own password. Avoids cleartext-password email.
+    placeholder_pw = _secrets.token_urlsafe(32)
     doc = {
         "email":         req.email,
-        "password_hash": hash_password(req.password),
+        "password_hash": hash_password(placeholder_pw),
         "name":          req.name,
         "role":          role,
         "created_at":    int(_time.time() * 1000),
@@ -560,18 +601,31 @@ def auth_register(req: RegisterReq) -> dict:
     )
     if r.status_code not in (200, 201):
         raise HTTPException(500, f"Register failed: {r.text[:200]}")
-    # Best-effort welcome email — silent if SMTP not configured
+
+    # Mint a one-time setup token (reuses reset-token machinery) — 24h TTL so
+    # the user has a reasonable window to click the link.
+    raw = _secrets.token_urlsafe(32)
+    requests.post(
+        f"{ES_URL}/{RESET_TOKENS_INDEX}/_doc?refresh=true",
+        auth=ES_AUTH, verify=False,
+        json={
+            "token_hash": _sha256_hex(raw),
+            "email":      req.email,
+            "expires_at": int(_time.time() + 24 * 3600),
+            "used":       False,
+        }, timeout=10,
+    )
     send_email(
         req.email,
-        "Welcome to GRP Support AI",
+        "Set up your GRP Support AI account",
         f"Hi {req.name or req.email},\n\n"
         f"An admin created an account for you on GRP Support AI.\n\n"
-        f"Sign in here: {FRONTEND_URL}\n"
-        f"Email:    {req.email}\n"
-        f"Password: {req.password}\n\n"
-        f"Please change your password after first sign-in.\n",
+        f"Set your password (link valid 24 hours):\n"
+        f"{FRONTEND_URL}/reset-password/?token={raw}\n\n"
+        f"After setting a password, sign in at {FRONTEND_URL}\n",
     )
-    return {"ok": True, "email": req.email, "role": role}
+    return {"ok": True, "email": req.email, "role": role,
+            "setup_link_sent": True}
 
 
 # ── Password reset (token-based, for users who forgot password) ───────────────
@@ -1856,6 +1910,12 @@ def query(req: QueryRequest, user: dict = Depends(current_user)):
     check_rate_limit(user["email"])
     check_token_budget()
 
+    # attached_files arrive as opaque HMAC tokens; resolve to filesystem paths
+    # while enforcing the token's owner matches the requesting user.
+    if req.attached_files:
+        req.attached_files = [_resolve_upload_token(t, user["email"])
+                              for t in req.attached_files]
+
     t0 = _time.time()
     try:
         embedding = get_embedding(req.question)
@@ -2033,14 +2093,18 @@ def query_stream(req: QueryRequest, user: dict = Depends(current_user)):
         raise HTTPException(status_code=400, detail="Empty question")
     check_rate_limit(user["email"])
     check_token_budget()
+    if req.attached_files:
+        req.attached_files = [_resolve_upload_token(t, user["email"])
+                              for t in req.attached_files]
     return StreamingResponse(_stream_claude_agent(user["email"], req),
                              media_type="text/event-stream")
 
 
 # ── Routes: Chat file upload (one-shot, Claude reads at query time) ────────────
 
-@app.post("/upload-chat-file", dependencies=[Depends(current_user)])
-async def upload_chat_file(file: UploadFile = File(...)) -> dict:
+@app.post("/upload-chat-file")
+async def upload_chat_file(file: UploadFile = File(...),
+                            user: dict = Depends(current_user)) -> dict:
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in CHAT_UPLOAD_EXTS:
         raise HTTPException(status_code=400, detail=f"Unsupported type: {ext}")
@@ -2064,7 +2128,11 @@ async def upload_chat_file(file: UploadFile = File(...)) -> dict:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"DOCX conversion failed: {e}")
 
-    return {"path": saved, "name": file.filename, "size": len(data)}
+    # Return an opaque, HMAC-signed token (NOT the server filesystem path) so
+    # a leaked id from one user cannot be replayed by another. /query and
+    # /query/stream resolve the token back to a path while enforcing owner.
+    token = _make_upload_token(saved, user["email"])
+    return {"id": token, "name": file.filename, "size": len(data)}
 
 
 # ── Routes: Index management ────────────────────────────────────────────────────
@@ -2305,7 +2373,24 @@ async def upload_document(
     except Exception:
         meta = {}
 
-    content_bytes = await file.read()
+    if doc_type not in DOCUMENT_UPLOAD_EXTS:
+        raise HTTPException(400, f"Unknown doc_type: {doc_type}")
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in DOCUMENT_UPLOAD_EXTS[doc_type]:
+        raise HTTPException(
+            400,
+            f"doc_type '{doc_type}' requires one of "
+            f"{sorted(DOCUMENT_UPLOAD_EXTS[doc_type])}, got '{ext}'",
+        )
+
+    # Cap memory: read at most MAX+1 bytes so oversized uploads fail fast
+    # instead of buffering the whole body.
+    content_bytes = await file.read(DOCUMENT_UPLOAD_MAX_BYTES + 1)
+    if len(content_bytes) > DOCUMENT_UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            413,
+            f"File too large (max {DOCUMENT_UPLOAD_MAX_BYTES // (1024*1024)} MB)",
+        )
 
     if doc_type == "manual":
         return _handle_manual(content_bytes, file.filename, meta)
@@ -2315,8 +2400,6 @@ async def upload_document(
         return _handle_script(content_bytes, file.filename, meta)
     elif doc_type == "code":
         return _handle_code(content_bytes, file.filename, meta)
-    else:
-        raise HTTPException(400, f"Unknown doc_type: {doc_type}")
 
 
 # Match Images/<stem>/[media/]file regardless of any prefix (tmp dir, MD/, etc.)

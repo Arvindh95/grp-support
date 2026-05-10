@@ -19,7 +19,7 @@ USER=claudeuser
 
 echo "── 1. apt deps ──"
 apt-get update
-apt-get install -y python3 python3-pip nginx pandoc curl jq nodejs npm
+apt-get install -y python3 python3-pip nginx pandoc curl jq nodejs npm certbot
 
 echo "── 2. service user ──"
 id "$USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$USER"
@@ -42,25 +42,44 @@ install -m 644 deploy/systemd/grp-api.service /etc/systemd/system/
 install -m 644 deploy/systemd/grp-chat.service /etc/systemd/system/
 systemctl daemon-reload
 
-echo "── 6. nginx sites ──"
-install -m 644 deploy/nginx/grp-chat /etc/nginx/sites-available/
-install -m 644 deploy/nginx/grp-images /etc/nginx/sites-available/
-ln -sf /etc/nginx/sites-available/grp-chat /etc/nginx/sites-enabled/
-ln -sf /etc/nginx/sites-available/grp-images /etc/nginx/sites-enabled/
+echo "── 6. TLS cert (Let's Encrypt via nip.io) ──"
+HOST="${PUBLIC_HOST:-$(hostname -I | awk '{print $1}' | tr . - ).nip.io}"
+mkdir -p /var/www/letsencrypt
+if [ ! -f "/etc/letsencrypt/live/$HOST/fullchain.pem" ]; then
+    cat > /etc/nginx/sites-available/grp-acme <<EOF
+server {
+    listen 80;
+    server_name $HOST;
+    location /.well-known/acme-challenge/ { root /var/www/letsencrypt; }
+    location / { return 503 'Setting up TLS\n'; }
+}
+EOF
+    ln -sf /etc/nginx/sites-available/grp-acme /etc/nginx/sites-enabled/grp-acme
+    nginx -t && systemctl reload nginx
+    EMAIL="${ADMIN_EMAIL:-admin@example.com}"
+    certbot certonly --webroot -w /var/www/letsencrypt -d "$HOST" \
+        --non-interactive --agree-tos --email "$EMAIL"
+    rm -f /etc/nginx/sites-enabled/grp-acme
+fi
+
+echo "── 7. nginx TLS site ──"
+sed "s|173.212.247.3.nip.io|$HOST|g" deploy/nginx/grp-chat-tls \
+    > /etc/nginx/sites-available/grp-chat-tls
+ln -sf /etc/nginx/sites-available/grp-chat-tls /etc/nginx/sites-enabled/grp-chat-tls
 nginx -t && systemctl reload nginx
 
-echo "── 7. start backend ──"
+echo "── 8. start backend ──"
 [ -f /etc/grp-api.env ] || { echo "ERROR: /etc/grp-api.env missing — copy from .env.example first"; exit 1; }
 chmod 600 /etc/grp-api.env
 chown root:root /etc/grp-api.env
 systemctl enable --now grp-api
 # systemctl enable --now grp-chat   # uncomment if you want Streamlit too
 
-echo "── 8. bootstrap admin (one-time) ──"
+echo "── 9. bootstrap admin (one-time) ──"
 echo "   Run manually: ADMIN_EMAIL=you@example.com ADMIN_PASSWORD='ChangeMe123' \\"
 echo "                 sudo -u $USER python3 $REPO/bootstrap_admin.py"
 
-echo "── 9. health ──"
+echo "── 10. health ──"
 sleep 3
 curl -fsS http://127.0.0.1:8000/health && echo
-echo "Done. Frontend on :8081, images on :8080, API on :8000."
+echo "Done. Frontend on https://$HOST, API behind /api/, images on /images/."

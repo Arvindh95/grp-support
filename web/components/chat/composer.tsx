@@ -10,7 +10,7 @@ const ALLOWED_EXTS = [".pdf", ".md", ".txt", ".docx", ".png", ".jpg", ".jpeg", "
 const MAX_BYTES = 25 * 1024 * 1024;
 
 export type Attachment = {
-  path: string;
+  id: string;
   name: string;
   size: number;
 };
@@ -72,8 +72,8 @@ export function Composer({ onSend, disabled, placeholder }: ComposerProps) {
     if (fileRef.current) fileRef.current.value = "";
   }
 
-  function removeAttachment(path: string) {
-    setAttached((prev) => prev.filter((a) => a.path !== path));
+  function removeAttachment(id: string) {
+    setAttached((prev) => prev.filter((a) => a.id !== id));
   }
 
   return (
@@ -84,14 +84,14 @@ export function Composer({ onSend, disabled, placeholder }: ComposerProps) {
           <div className="flex flex-wrap gap-2">
             {attached.map((a) => (
               <span
-                key={a.path}
+                key={a.id}
                 className="inline-flex items-center gap-1 text-xs bg-muted rounded px-2 py-1"
               >
                 <Paperclip className="h-3 w-3" />
                 <span className="max-w-[200px] truncate">{a.name}</span>
                 <button
                   type="button"
-                  onClick={() => removeAttachment(a.path)}
+                  onClick={() => removeAttachment(a.id)}
                   className="hover:text-destructive ml-1"
                   aria-label="Remove attachment"
                 >

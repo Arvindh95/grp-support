@@ -1,0 +1,64 @@
+limit_req_zone $binary_remote_addr zone=grp_tls_per_ip:10m rate=120r/m;
+
+# HTTP — ACME challenge + redirect everything else to HTTPS
+server {
+    listen 80;
+    server_name 173.212.247.3.nip.io;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+    }
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# HTTPS — main vhost
+server {
+    listen 443 ssl http2;
+    server_name 173.212.247.3.nip.io;
+
+    ssl_certificate     /etc/letsencrypt/live/173.212.247.3.nip.io/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/173.212.247.3.nip.io/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    access_log /var/log/nginx/grp-chat-tls.access.log;
+    error_log  /var/log/nginx/grp-chat-tls.error.log;
+
+    root /opt/grp-chat-web;
+    index index.html;
+    client_max_body_size 30M;
+
+    location /api/ {
+        limit_req zone=grp_tls_per_ip burst=40 nodelay;
+        proxy_pass http://127.0.0.1:8000/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+    }
+
+    location /images/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+
+    location /_next/static/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    location / {
+        try_files $uri $uri/ $uri/index.html /index.html;
+    }
+}
