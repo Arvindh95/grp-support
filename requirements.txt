@@ -13,5 +13,6 @@ anthropic
 bcrypt
 PyJWT
 
-# Loaders (load_manuals.py, load_rfs_embed.py)
+# Loaders (load_manuals.py, load_rfs_embed.py) and /upload-document RFS .xlsx ingest
 xlrd
+openpyxl

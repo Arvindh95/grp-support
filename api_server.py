@@ -401,6 +401,12 @@ def _user_from_api_key(raw_key: str) -> dict | None:
     if not hits:
         return None
     src = hits[0]["_source"]
+    owner_email = src.get("owner", "")
+    # Re-validate owner is still an active user, and read role live (not the
+    # stale snapshot on the key doc).
+    owner = get_user_by_email(owner_email) if owner_email else None
+    if not owner:
+        return None
     # Best-effort last_used update; do not block.
     def _touch():
         try:
@@ -412,7 +418,7 @@ def _user_from_api_key(raw_key: str) -> dict | None:
         except Exception:
             pass
     _threading.Thread(target=_touch, daemon=True).start()
-    return {"email": src.get("owner", "apikey"), "role": src.get("role", "user"),
+    return {"email": owner_email, "role": owner.get("role", "user"),
             "auth": "apikey", "key_name": src.get("name", "")}
 
 
@@ -427,15 +433,31 @@ def verify_password(pw: str, hashed: str) -> bool:
         return False
 
 
-def make_token(email: str, role: str) -> str:
+def make_token(email: str, role: str, token_version: int = 0) -> str:
     now = _dt.datetime.now(_dt.timezone.utc)
     payload = {
         "sub":  email,
         "role": role,
+        "tv":   int(token_version),
         "iat":  int(now.timestamp()),
         "exp":  int((now + _dt.timedelta(hours=JWT_TTL_HOURS)).timestamp()),
     }
     return _jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+
+def _bump_token_version(email: str) -> None:
+    """Invalidate all existing JWTs for this user (called on pw change/reset)."""
+    requests.post(
+        f"{ES_URL}/{USERS_INDEX}/_update_by_query?refresh=true",
+        auth=ES_AUTH, verify=False,
+        json={
+            "script": {
+                "source": "ctx._source.token_version = (ctx._source.token_version == null ? 1 : ctx._source.token_version + 1)",
+            },
+            "query": {"term": {"email": email}},
+        },
+        timeout=10,
+    )
 
 
 def get_user_by_email(email: str) -> dict | None:
@@ -468,7 +490,17 @@ def current_user(request: Request, token: str | None = Depends(oauth2_scheme)) -
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token expired")
     except _jwt.PyJWTError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token")
-    return {"email": payload["sub"], "role": payload.get("role", "user"), "auth": "jwt"}
+
+    # Re-validate against active user state — catches deleted/demoted users
+    # and stale tokens after password change/reset.
+    email = payload["sub"]
+    src = get_user_by_email(email)
+    if not src:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User no longer exists")
+    if int(src.get("token_version", 0)) != int(payload.get("tv", 0)):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token revoked")
+    # Trust live role from the user doc, not the snapshot in the token.
+    return {"email": email, "role": src.get("role", "user"), "auth": "jwt"}
 
 
 def require_admin(user: dict = Depends(current_user)) -> dict:
@@ -495,8 +527,9 @@ def auth_login(req: LoginReq) -> dict:
     if not user or not verify_password(req.password, user.get("password_hash", "")):
         raise HTTPException(401, "Invalid credentials")
     role = user.get("role", "user")
+    tv = int(user.get("token_version", 0))
     return {
-        "access_token": make_token(req.email, role),
+        "access_token": make_token(req.email, role, tv),
         "token_type":   "bearer",
         "email":        req.email,
         "role":         role,
@@ -612,6 +645,7 @@ def auth_reset_confirm(req: ResetConfirmReq) -> dict:
             "query": {"term": {"email": email}},
         }, timeout=10,
     )
+    _bump_token_version(email)
     requests.post(
         f"{ES_URL}/{RESET_TOKENS_INDEX}/_update/{hits[0]['_id']}?refresh=true",
         auth=ES_AUTH, verify=False, json={"doc": {"used": True}}, timeout=10,
@@ -700,6 +734,7 @@ def auth_change_password(req: ChangePasswordReq, user: dict = Depends(current_us
     )
     if r.status_code != 200:
         raise HTTPException(500, f"Update failed: {r.text[:200]}")
+    _bump_token_version(user["email"])
     return {"ok": True}
 
 
@@ -757,6 +792,7 @@ def auth_reset_password(email: str, req: ResetPasswordReq) -> dict:
     )
     if r.status_code != 200:
         raise HTTPException(500, f"Reset failed: {r.text[:200]}")
+    _bump_token_version(email)
     return {"ok": True, "email": email}
 
 
@@ -1558,10 +1594,30 @@ ES_TOOLS = [
 _TOOL_RESULT_CAP = 50_000  # per call; oversized ES responses get truncated
 _MAX_TOOL_ITERS  = 20      # hard ceiling on agent loop
 
+# Hard server-side allowlist. Prevents prompt-injection from reading internal
+# indices (users, api-keys, audit, chats, reset-tokens) via the agent's tools.
+_AGENT_ALLOWED_INDICES: set[str] = {
+    "grp-manuals",
+    SCRIPTS_INDEX,
+    CODE_INDEX,
+    *RFS_INDICES,
+}
+
+
+def _check_index_allowed(idx: str) -> str | None:
+    if idx not in _AGENT_ALLOWED_INDICES:
+        return (f"Refused: index '{idx}' is not in the agent allowlist. "
+                f"Allowed indices: {sorted(_AGENT_ALLOWED_INDICES)}")
+    return None
+
 
 def _tool_es_search(input_: dict) -> str:
+    idx = input_.get("index", "")
+    err = _check_index_allowed(idx)
+    if err:
+        return err
     r = requests.post(
-        f"{ES_URL}/{input_['index']}/_search",
+        f"{ES_URL}/{idx}/_search",
         auth=ES_AUTH, verify=False, json=input_["body"], timeout=30,
     )
     return r.text
@@ -1570,11 +1626,22 @@ def _tool_es_search(input_: dict) -> str:
 def _tool_es_list_indices(_: dict) -> str:
     r = requests.get(f"{ES_URL}/_cat/indices?format=json",
                      auth=ES_AUTH, verify=False, timeout=10)
-    return r.text
+    if r.status_code != 200:
+        return r.text
+    try:
+        all_idx = r.json()
+    except Exception:
+        return r.text
+    filtered = [x for x in all_idx if x.get("index") in _AGENT_ALLOWED_INDICES]
+    return json.dumps(filtered)
 
 
 def _tool_es_get_mappings(input_: dict) -> str:
-    r = requests.get(f"{ES_URL}/{input_['index']}/_mapping",
+    idx = input_.get("index", "")
+    err = _check_index_allowed(idx)
+    if err:
+        return err
+    r = requests.get(f"{ES_URL}/{idx}/_mapping",
                      auth=ES_AUTH, verify=False, timeout=10)
     return r.text
 
