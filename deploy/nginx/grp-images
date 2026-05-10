@@ -1,0 +1,17 @@
+server {
+    listen 8080;
+    server_name _;
+
+    access_log /var/log/nginx/grp-images.access.log;
+    error_log  /var/log/nginx/grp-images.error.log;
+
+    location / {
+        # Forward to FastAPI /images/<path> — HMAC sig validated by backend.
+        # Plain GETs (no sig query param) get 403 from FastAPI.
+        rewrite ^/(.*)$ /images/$1 break;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}

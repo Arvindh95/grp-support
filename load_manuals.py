@@ -10,8 +10,8 @@ import requests
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ES_URL      = "https://localhost:9200"
-ES_AUTH     = ("elastic", "W1iUd3PBH2qvhEcTc9mR")
+ES_URL      = os.environ.get("ES_URL", "https://localhost:9200")
+ES_AUTH     = (os.environ.get("ES_USER", "elastic"), os.environ["ES_PASSWORD"])
 ES_VERIFY   = False
 OLLAMA_URL  = "http://localhost:11434"
 EMBED_MODEL = "bge-m3"

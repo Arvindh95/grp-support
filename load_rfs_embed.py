@@ -5,13 +5,13 @@ Groups rows by ticket (lodge_id) -> 1 doc per ticket -> embed -> push ES
 Run on server: python3 load_rfs_embed.py
 """
 
-import xlrd, json, time, sys, re, requests
+import os, xlrd, json, time, sys, re, requests
 from pathlib import Path
 from collections import defaultdict
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-ES_URL      = "https://localhost:9200"
-ES_AUTH     = ("elastic", "W1iUd3PBH2qvhEcTc9mR")
+ES_URL      = os.environ.get("ES_URL", "https://localhost:9200")
+ES_AUTH     = (os.environ.get("ES_USER", "elastic"), os.environ["ES_PASSWORD"])
 ES_VERIFY   = False
 OLLAMA_URL  = "http://localhost:11434"
 EMBED_MODEL = "bge-m3"

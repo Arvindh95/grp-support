@@ -91,6 +91,8 @@ export default function ChatPage() {
     let accumulated = "";
     let finalAnswer = "";
     let toolCalls: { name: string; input: unknown }[] = [];
+    let finalSources: Message["sources"] = undefined;
+    let finalImages: Message["images"] = undefined;
     const histForCall = [...history, { role: "user", content: text }];
 
     try {
@@ -122,6 +124,8 @@ export default function ChatPage() {
           });
         } else if (ev.type === "done") {
           finalAnswer = ev.answer;
+          finalSources = ev.sources;
+          finalImages = ev.images;
           setMessages((prev) => {
             const out = prev.slice();
             const last = out[out.length - 1];
@@ -166,28 +170,20 @@ export default function ChatPage() {
 
     // Persist chat (best-effort) — title set from first user msg if still default
     if (id) {
-      const allMessages = [
+      const finalMessages: Message[] = [
         ...messages,
         userMsg,
         {
           role: "assistant",
           content: finalAnswer || accumulated,
-          // We don't re-include sources/images here to keep stored chats compact;
-          // they'll be re-fetched on load if your spec needs them. (For now they
-          // are stored — copy from latest state.)
-        } as Message,
+          sources: finalSources,
+          images: finalImages,
+          tool_calls: toolCalls,
+        },
       ];
-      // Actually, store latest from state:
       try {
-        // Wait a tick so the state update has flushed (best-effort).
-        await new Promise((r) => setTimeout(r, 0));
-        const patch: { title?: string; messages?: Message[] } = {};
+        const patch: { title?: string; messages?: Message[] } = { messages: finalMessages };
         if (!title || title === "New chat") patch.title = text.slice(0, 60);
-        // Use the most recent state by reading via callback
-        setMessages((latest) => {
-          patch.messages = latest;
-          return latest;
-        });
         await updateChat(id, patch);
       } catch {
         /* save errors are non-fatal */

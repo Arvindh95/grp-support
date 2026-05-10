@@ -1,0 +1,16 @@
+[Unit]
+Description=GRP API Server (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=claudeuser
+WorkingDirectory=/opt/grp-chat
+Environment=PYTHONPATH=/home/claudeuser/.local/lib/python3.12/site-packages
+EnvironmentFile=/etc/grp-api.env
+ExecStart=/home/claudeuser/.local/bin/uvicorn api_server:app --host 127.0.0.1 --port 8000 --workers 4
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
