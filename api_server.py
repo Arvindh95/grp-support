@@ -579,6 +579,15 @@ def auth_me(user: dict = Depends(current_user)) -> dict:
 
 @app.post("/auth/register", dependencies=[Depends(require_admin)])
 def auth_register(req: RegisterReq) -> dict:
+    # Without SMTP we can't deliver the setup link, and without the link the
+    # account has no usable password. Refuse rather than silently creating an
+    # unreachable user.
+    if not SMTP_HOST:
+        raise HTTPException(
+            503,
+            "SMTP not configured — cannot send account setup link. "
+            "Set SMTP_HOST in /etc/grp-api.env and restart grp-api.",
+        )
     if get_user_by_email(req.email):
         raise HTTPException(409, "User already exists")
     role = req.role if req.role in ("user", "admin") else "user"
@@ -1645,9 +1654,10 @@ ES_TOOLS = [
 _TOOL_RESULT_CAP = 50_000  # per call; oversized ES responses get truncated
 _MAX_TOOL_ITERS  = 20      # hard ceiling on agent loop
 
-# Hard server-side allowlist. Prevents prompt-injection from reading internal
-# indices (users, api-keys, audit, chats, reset-tokens) via the agent's tools.
-_AGENT_ALLOWED_INDICES: set[str] = {
+# Hard server-side allowlist. Prevents prompt-injection (agent tools) and
+# admin-route path-injection (delete-index, reindex, search, etc.) from
+# touching internal indices (users, api-keys, audit, chats, reset-tokens).
+_KNOWLEDGE_INDICES: set[str] = {
     "grp-manuals",
     SCRIPTS_INDEX,
     CODE_INDEX,
@@ -1656,10 +1666,21 @@ _AGENT_ALLOWED_INDICES: set[str] = {
 
 
 def _check_index_allowed(idx: str) -> str | None:
-    if idx not in _AGENT_ALLOWED_INDICES:
-        return (f"Refused: index '{idx}' is not in the agent allowlist. "
-                f"Allowed indices: {sorted(_AGENT_ALLOWED_INDICES)}")
+    """Agent tool-side check: returns error string instead of raising."""
+    if idx not in _KNOWLEDGE_INDICES:
+        return (f"Refused: index '{idx}' is not in the knowledge allowlist. "
+                f"Allowed indices: {sorted(_KNOWLEDGE_INDICES)}")
     return None
+
+
+def _require_knowledge_index(idx: str) -> None:
+    """HTTP route-side check: raises 400 outside the allowlist."""
+    if idx not in _KNOWLEDGE_INDICES:
+        raise HTTPException(
+            400,
+            f"Index '{idx}' is not a knowledge index. "
+            f"Allowed: {sorted(_KNOWLEDGE_INDICES)}",
+        )
 
 
 def _tool_es_search(input_: dict) -> str:
@@ -1683,7 +1704,7 @@ def _tool_es_list_indices(_: dict) -> str:
         all_idx = r.json()
     except Exception:
         return r.text
-    filtered = [x for x in all_idx if x.get("index") in _AGENT_ALLOWED_INDICES]
+    filtered = [x for x in all_idx if x.get("index") in _KNOWLEDGE_INDICES]
     return json.dumps(filtered)
 
 
@@ -2137,6 +2158,7 @@ async def upload_chat_file(file: UploadFile = File(...),
 @app.delete("/delete-index/{index_name}", dependencies=[Depends(require_admin)])
 def delete_index(index_name: str) -> dict:
     """Delete an ES index entirely. Irreversible."""
+    _require_knowledge_index(index_name)
     r = requests.delete(
         f"{ES_URL}/{index_name}",
         auth=ES_AUTH, verify=False, timeout=15
@@ -2186,6 +2208,7 @@ def knowledge_base_summary() -> dict:
 @app.get("/index-files/{index_name}", dependencies=[Depends(current_user)])
 def list_index_files(index_name: str) -> list[dict]:
     """List unique files indexed in an index with doc counts."""
+    _require_knowledge_index(index_name)
     field = _file_field_for_index(index_name)
     r = requests.post(
         f"{ES_URL}/{index_name}/_search",
@@ -2201,6 +2224,7 @@ def list_index_files(index_name: str) -> list[dict]:
 @app.delete("/delete-file", dependencies=[Depends(require_admin)])
 def delete_file_from_index(index_name: str, source_file: str) -> dict:
     """Delete all docs with matching file field from an index."""
+    _require_knowledge_index(index_name)
     field = _file_field_for_index(index_name)
     # Use term on keyword field (strip .keyword suffix not needed — term works on keyword sub-fields)
     r = requests.post(
@@ -2217,6 +2241,7 @@ def delete_file_from_index(index_name: str, source_file: str) -> dict:
 @app.get("/index-files/{index_name}/chunks", dependencies=[Depends(current_user)])
 def get_file_chunks(index_name: str, source_file: str = Query(...)) -> list[dict]:
     """List individual chunks for a specific source_file in an index."""
+    _require_knowledge_index(index_name)
     field = _file_field_for_index(index_name)
     r = requests.post(
         f"{ES_URL}/{index_name}/_search",
@@ -2237,6 +2262,7 @@ def get_file_chunks(index_name: str, source_file: str = Query(...)) -> list[dict
 @app.post("/reindex/{index_name}", dependencies=[Depends(require_admin)])
 def reindex(index_name: str) -> dict:
     """Re-embed all docs in an index using current embed model. Runs synchronously."""
+    _require_knowledge_index(index_name)
     r = requests.post(
         f"{ES_URL}/{index_name}/_search",
         auth=ES_AUTH, verify=False, timeout=15,
@@ -2275,6 +2301,7 @@ def reindex(index_name: str) -> dict:
 @app.get("/search", dependencies=[Depends(current_user)])
 def search(q: str = Query(...), index: str = Query(...), size: int = 10) -> list[dict]:
     """Direct BM25 keyword search — no Claude, instant results."""
+    _require_knowledge_index(index)
     all_text_fields = {
         "grp-manuals":    ["content^2", "section^3", "module^2", "image_captions"],
         SCRIPTS_INDEX:    ["purpose^3", "content^2", "tables^2"],
@@ -2599,6 +2626,13 @@ def _handle_rfs(content_bytes: bytes, filename: str, meta: dict) -> dict:
             target_index = MONTH_INDEX_MAP.get(dominant_month, "rfs-tickets-jan-2025")
         else:
             target_index = "rfs-tickets-jan-2025"
+    # Admin-supplied target must be one of the configured RFS month indices.
+    if target_index not in RFS_INDICES:
+        raise HTTPException(
+            400,
+            f"RFS target index '{target_index}' is not a configured RFS index. "
+            f"Allowed: {sorted(RFS_INDICES)}",
+        )
 
     # Ensure index exists
     r = requests.get(f"{ES_URL}/{target_index}", auth=ES_AUTH, verify=False)

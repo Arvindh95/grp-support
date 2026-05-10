@@ -321,13 +321,22 @@ def admin_token(client):
 
 @pytest.fixture()
 def user_token(client, admin_token):
-    """Create a normal user and return a JWT bearer token."""
-    r = client.post(
-        "/auth/register",
-        headers={"Authorization": f"Bearer {admin_token}"},
-        json={"email": "joe@test", "password": "joepass1", "name": "Joe", "role": "user"},
+    """Create a normal user and return a JWT bearer token.
+
+    /auth/register now ignores any password and emails a setup link, so we
+    bypass the route and seed the user doc directly (same approach as
+    admin_token). Tests that exercise the /auth/register flow itself should
+    stub SMTP and consume the resulting reset token instead.
+    """
+    import api_server as A
+    A.requests.post(
+        f"{A.ES_URL}/{A.USERS_INDEX}/_doc",
+        json={
+            "email": "joe@test", "password_hash": A.hash_password("joepass1"),
+            "name": "Joe", "role": "user",
+            "created_at": int(__import__('time').time() * 1000),
+        },
     )
-    assert r.status_code == 200, r.text
     r = client.post("/auth/login", json={"email": "joe@test", "password": "joepass1"})
     assert r.status_code == 200, r.text
     return r.json()["access_token"]

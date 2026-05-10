@@ -19,7 +19,13 @@ USER=claudeuser
 
 echo "── 1. apt deps ──"
 apt-get update
-apt-get install -y python3 python3-pip nginx pandoc curl jq nodejs npm certbot
+apt-get install -y python3 python3-pip nginx pandoc curl jq certbot ca-certificates gnupg
+
+# Node 20 from NodeSource — Next 16 requires >=20.9, Ubuntu 22.04 ships 18.x
+if ! command -v node >/dev/null 2>&1 || [ "$(node -v | cut -d. -f1 | tr -d v)" -lt 20 ]; then
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    apt-get install -y nodejs
+fi
 
 echo "── 2. service user ──"
 id "$USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$USER"
