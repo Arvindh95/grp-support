@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Alert } from "@/components/ui/alert";
-import { api, API_URL, getToken } from "@/lib/api";
+import { api, API_URL } from "@/lib/api";
 
 type DocType = "manual" | "rfs" | "script" | "code";
 
@@ -54,7 +54,6 @@ export default function UploadPage() {
   }
 
   async function uploadOne(file: File): Promise<ResultLine> {
-    const tok = getToken();
     const fd = new FormData();
     fd.append("file", file);
 
@@ -69,7 +68,7 @@ export default function UploadPage() {
     try {
       const res = await fetch(url, {
         method: "POST",
-        headers: tok ? { Authorization: `Bearer ${tok}` } : {},
+        credentials: "include",
         body: fd,
       });
       if (!res.ok) {

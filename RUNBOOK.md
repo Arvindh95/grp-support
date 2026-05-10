@@ -8,16 +8,17 @@ All commands assume you are SSH'd into the VPS as a sudoer.
 
 | Service       | Port  | systemd unit  | Working dir          |
 |---------------|-------|---------------|----------------------|
-| FastAPI (uvicorn) | 8000 | `grp-api`     | `/opt/grp-chat`      |
-| Streamlit     | 8501  | `grp-chat`    | `/opt/grp-chat`      |
-| nginx         | 8081  | `nginx`       | `/etc/nginx/sites-enabled/grp-chat` |
+| FastAPI (uvicorn) | 8000 (loopback) | `grp-api` | `/opt/grp-chat` |
+| nginx (HTTPS) | 443 + 80 redirect | `nginx` | `/etc/nginx/sites-enabled/grp-chat-tls` |
 | Elasticsearch | 9200  | `elasticsearch` | `/etc/elasticsearch` |
 | Ollama        | 11434 | `ollama`      | n/a                  |
 
-Env file (loaded by both `grp-api` and `grp-chat` services):
-`/etc/grp-api.env` — contains `ES_USER`, `ES_PASSWORD`, `ANTHROPIC_API_KEY`,
-`JWT_SECRET`, optional `SMTP_*`, `SLACK_WEBHOOK_URL`, `MONTHLY_TOKEN_BUDGET`,
-`IMG_PUBLIC_BASE`, `FRONTEND_URL`.
+Public URL: `https://173.212.247.3.nip.io` (Let's Encrypt cert auto-renews).
+Built React frontend lives in `/opt/grp-chat-web` (served as static by nginx).
+
+Env file (loaded by `grp-api`): `/etc/grp-api.env` — contains `ES_USER`,
+`ES_PASSWORD`, `ANTHROPIC_API_KEY`, `JWT_SECRET`, optional `SMTP_*`,
+`SLACK_WEBHOOK_URL`, `MONTHLY_TOKEN_BUDGET`, `IMG_PUBLIC_BASE`, `FRONTEND_URL`.
 
 ## Deploy a code change
 
@@ -25,8 +26,14 @@ Env file (loaded by both `grp-api` and `grp-chat` services):
 ssh root@173.212.247.3
 cd /opt/grp-chat
 sudo -u claudeuser git pull
-systemctl restart grp-api grp-chat
+systemctl restart grp-api
 journalctl -u grp-api -n 50 --no-pager   # confirm clean start
+
+# Frontend rebuild (when web/ changed):
+cd /opt/grp-chat/web && sudo -u claudeuser npm ci --silent && sudo -u claudeuser npm run build
+sudo rm -rf /opt/grp-chat-web/* /opt/grp-chat-web/.[!.]* 2>/dev/null
+sudo cp -r out/. /opt/grp-chat-web/
+sudo chown -R www-data:www-data /opt/grp-chat-web
 ```
 
 CI/CD does this automatically on push to `main` once the GitHub Actions
@@ -35,7 +42,7 @@ workflow is enabled (see `.github/workflows/deploy.yml`).
 ## Restart everything
 
 ```bash
-systemctl restart grp-api grp-chat nginx elasticsearch ollama
+systemctl restart grp-api nginx elasticsearch ollama
 ```
 
 In dependency order. ES first if it is the one stuck.
@@ -58,7 +65,7 @@ URLs**. Plan a maintenance window.
 ```bash
 NEW=$(openssl rand -hex 64)
 sed -i "s|^JWT_SECRET=.*|JWT_SECRET=$NEW|" /etc/grp-api.env
-systemctl restart grp-api grp-chat
+systemctl restart grp-api
 ```
 
 All users will have to log in again.
@@ -70,9 +77,9 @@ Two options. Prefer (1) if SMTP is configured.
 1. **Self-service reset** — the user clicks "Forgot password" on the login
    page. They get an email with a 1-hour reset link.
 
-2. **Admin reset** — sign in as admin and `POST /auth/users/<email>/reset-password`
-   with the new password, or use the Streamlit admin panel. Tell the user the
-   new password out-of-band; ask them to change it on first login.
+2. **Admin reset** — sign in as admin at `https://173.212.247.3.nip.io/admin/users/`
+   and click "Reset", or `POST /auth/users/<email>/reset-password` directly.
+   Tell the user the new password out-of-band; ask them to change it on first login.
 
 ```bash
 TOKEN=$(curl -fsS -X POST http://127.0.0.1:8000/auth/login \
@@ -260,15 +267,6 @@ the backend at response time and are valid for `IMG_SIGN_TTL` seconds
 (default = 12h). Anyone trying to fetch an image without a signature gets
 403.
 
-If your nginx still routes the legacy `:8080` → static directory, replace
-that block with a proxy to FastAPI:
-
-```nginx
-location /images/ {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_set_header Host $host;
-}
-```
-
-And set `IMG_PUBLIC_BASE` to `https://<your-host>:8081/images` (or wherever
-the proxy lands) so signed URLs point at the proxied path.
+The TLS vhost (`/etc/nginx/sites-enabled/grp-chat-tls`) already proxies
+`/images/` to FastAPI on `:8000` and `IMG_PUBLIC_BASE` is set to
+`https://173.212.247.3.nip.io/images`, so signed URLs work end-to-end.

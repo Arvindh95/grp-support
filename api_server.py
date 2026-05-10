@@ -354,6 +354,7 @@ app.add_middleware(
     ],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,  # required so the browser sends the HttpOnly auth cookie
 )
 
 
@@ -379,7 +380,7 @@ import time as _time
 import hmac as _hmac
 import hashlib as _hashlib
 import secrets as _secrets
-from fastapi import Depends, status, Request
+from fastapi import Depends, status, Request, Response
 from fastapi.security import OAuth2PasswordBearer
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
@@ -442,6 +443,7 @@ def verify_password(pw: str, hashed: str) -> bool:
 def make_token(email: str, role: str, token_version: int = 0) -> str:
     now = _dt.datetime.now(_dt.timezone.utc)
     payload = {
+        "typ":  "auth",          # distinguish from upload tokens (typ="upload")
         "sub":  email,
         "role": role,
         "tv":   int(token_version),
@@ -456,6 +458,7 @@ def make_token(email: str, role: str, token_version: int = 0) -> str:
 # so a leaked path can't be exfiltrated by another authenticated user.
 def _make_upload_token(path: str, owner: str, ttl: int = 86400) -> str:
     payload = {
+        "typ": "upload",         # distinguish from auth JWTs (typ="auth")
         "p":   path,
         "o":   owner,
         "exp": int(_time.time()) + ttl,
@@ -468,6 +471,8 @@ def _resolve_upload_token(token: str, owner: str) -> str:
         payload = _jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except _jwt.PyJWTError:
         raise HTTPException(403, "Invalid or expired upload token")
+    if payload.get("typ") != "upload":
+        raise HTTPException(403, "Wrong token type")
     if payload.get("o") != owner:
         raise HTTPException(403, "Upload token owner mismatch")
     p = payload.get("p", "")
@@ -506,8 +511,12 @@ def get_user_by_email(email: str) -> dict | None:
     return hits[0]["_source"] if hits else None
 
 
+SESSION_COOKIE = "grp_jwt"
+
+
 def current_user(request: Request, token: str | None = Depends(oauth2_scheme)) -> dict:
-    # Accept either Bearer JWT or "Authorization: ApiKey <key>" header.
+    # Accept either: Bearer JWT (legacy / API clients), ApiKey header,
+    # or HttpOnly session cookie (browser).
     auth_hdr = request.headers.get("authorization", "")
     if auth_hdr.lower().startswith("apikey "):
         raw = auth_hdr.split(" ", 1)[1].strip()
@@ -516,6 +525,8 @@ def current_user(request: Request, token: str | None = Depends(oauth2_scheme)) -
             return u
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid API key")
     if not token:
+        token = request.cookies.get(SESSION_COOKIE)
+    if not token:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing token")
     try:
         payload = _jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
@@ -523,6 +534,15 @@ def current_user(request: Request, token: str | None = Depends(oauth2_scheme)) -
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token expired")
     except _jwt.PyJWTError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token")
+
+    # Reject upload tokens (or anything else) presented here as a bearer auth
+    # token. Auth JWTs explicitly carry typ="auth"; legacy tokens (no typ)
+    # remain accepted so existing sessions don't break.
+    typ = payload.get("typ", "auth")
+    if typ != "auth":
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Wrong token type")
+    if "sub" not in payload:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Malformed token")
 
     # Re-validate against active user state — catches deleted/demoted users
     # and stale tokens after password change/reset.
@@ -557,19 +577,40 @@ class RegisterReq(BaseModel):
 
 
 @app.post("/auth/login")
-def auth_login(req: LoginReq) -> dict:
+def auth_login(req: LoginReq, response: Response) -> dict:
     user = get_user_by_email(req.email)
     if not user or not verify_password(req.password, user.get("password_hash", "")):
         raise HTTPException(401, "Invalid credentials")
     role = user.get("role", "user")
     tv = int(user.get("token_version", 0))
+    token = make_token(req.email, role, tv)
+    # HttpOnly session cookie — JWT is no longer reachable from JavaScript,
+    # so XSS that lands in the SPA can't exfiltrate it. Secure means it only
+    # travels over HTTPS. SameSite=Lax is fine: API and SPA share origin.
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=JWT_TTL_HOURS * 3600,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
     return {
-        "access_token": make_token(req.email, role, tv),
+        # access_token kept in the body for API/CLI clients; browser SPA
+        # ignores it and reads the cookie instead.
+        "access_token": token,
         "token_type":   "bearer",
         "email":        req.email,
         "role":         role,
         "name":         user.get("name", ""),
     }
+
+
+@app.post("/auth/logout")
+def auth_logout(response: Response) -> dict:
+    response.delete_cookie(SESSION_COOKIE, path="/", samesite="lax", secure=True)
+    return {"ok": True}
 
 
 @app.get("/auth/me")
@@ -607,11 +648,12 @@ def auth_register(req: RegisterReq) -> dict:
     )
     if r.status_code not in (200, 201):
         raise HTTPException(500, f"Register failed: {r.text[:200]}")
+    user_doc_id = r.json().get("_id")
 
     # Mint a one-time setup token (reuses reset-token machinery) — 24h TTL so
     # the user has a reasonable window to click the link.
     raw = _secrets.token_urlsafe(32)
-    requests.post(
+    tok_r = requests.post(
         f"{ES_URL}/{RESET_TOKENS_INDEX}/_doc?refresh=true",
         auth=ES_AUTH, verify=False,
         json={
@@ -621,15 +663,33 @@ def auth_register(req: RegisterReq) -> dict:
             "used":       False,
         }, timeout=10,
     )
-    send_email(
-        req.email,
-        "Set up your GRP Support AI account",
-        f"Hi {req.name or req.email},\n\n"
-        f"An admin created an account for you on GRP Support AI.\n\n"
-        f"Set your password (link valid 24 hours):\n"
-        f"{FRONTEND_URL}/reset-password/?token={raw}\n\n"
-        f"After setting a password, sign in at {FRONTEND_URL}\n",
-    )
+    setup_token_id = tok_r.json().get("_id") if tok_r.status_code in (200, 201) else None
+
+    # Send setup email synchronously. If SMTP fails, roll back the user doc
+    # and the setup token so an admin can retry without a 409 collision and
+    # so we never leave an unreachable account behind.
+    try:
+        send_email_sync(
+            req.email,
+            "Set up your GRP Support AI account",
+            f"Hi {req.name or req.email},\n\n"
+            f"An admin created an account for you on GRP Support AI.\n\n"
+            f"Set your password (link valid 24 hours):\n"
+            f"{FRONTEND_URL}/reset-password/?token={raw}\n\n"
+            f"After setting a password, sign in at {FRONTEND_URL}\n",
+        )
+    except Exception as e:
+        if user_doc_id:
+            requests.delete(f"{ES_URL}/{USERS_INDEX}/_doc/{user_doc_id}?refresh=true",
+                            auth=ES_AUTH, verify=False, timeout=10)
+        if setup_token_id:
+            requests.delete(f"{ES_URL}/{RESET_TOKENS_INDEX}/_doc/{setup_token_id}?refresh=true",
+                            auth=ES_AUTH, verify=False, timeout=10)
+        raise HTTPException(
+            502,
+            f"Setup email failed; user not created. Check SMTP config. ({e})",
+        )
+
     return {"ok": True, "email": req.email, "role": role,
             "setup_link_sent": True}
 
@@ -1195,27 +1255,51 @@ def retention_run(audit_days: int = 90, chats_days: int = 365) -> dict:
 
 
 # ── SMTP / email ──────────────────────────────────────────────────────────────
-def send_email(to: str, subject: str, body: str) -> bool:
-    """Send a plain-text email. No-op + warning if SMTP_HOST is empty."""
-    if not SMTP_HOST:
-        log_kv("warning", "smtp-not-configured", to=to, subject=subject)
-        return False
-    import smtplib
+def _build_email_message(to: str, subject: str, body: str):
+    import smtplib  # noqa: F401 (re-exported for sync caller below)
     from email.message import EmailMessage
     msg = EmailMessage()
     msg["From"] = SMTP_FROM
     msg["To"] = to
     msg["Subject"] = subject
     msg.set_content(body)
+    return msg
+
+
+def _smtp_send(msg) -> None:
+    """Synchronous SMTP send. Raises on failure — caller decides what to do."""
+    import smtplib
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+        if SMTP_USE_TLS:
+            s.starttls()
+        if SMTP_USER:
+            s.login(SMTP_USER, SMTP_PASS)
+        s.send_message(msg)
+
+
+def send_email_sync(to: str, subject: str, body: str) -> None:
+    """Send email and raise on failure. Use for security-critical mail like
+    account setup links — caller can roll back on send failure."""
+    if not SMTP_HOST:
+        raise RuntimeError("SMTP not configured")
+    msg = _build_email_message(to, subject, body)
+    _smtp_send(msg)
+    log_kv("info", "email-sent-sync", to=to, subject=subject)
+
+
+def send_email(to: str, subject: str, body: str) -> bool:
+    """Fire-and-forget: send a plain-text email. No-op + warning if SMTP_HOST
+    is empty. Failures only log; caller never learns. Use for non-critical
+    mail (password-reset hints, alerts) — for security-critical mail prefer
+    send_email_sync()."""
+    if not SMTP_HOST:
+        log_kv("warning", "smtp-not-configured", to=to, subject=subject)
+        return False
+    msg = _build_email_message(to, subject, body)
 
     def _send():
         try:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-                if SMTP_USE_TLS:
-                    s.starttls()
-                if SMTP_USER:
-                    s.login(SMTP_USER, SMTP_PASS)
-                s.send_message(msg)
+            _smtp_send(msg)
             log_kv("info", "email-sent", to=to, subject=subject)
         except Exception as e:
             log_kv("warning", "email-send-failed", to=to, err=str(e))

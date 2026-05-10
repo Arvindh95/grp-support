@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { clearSession, getToken, getUser, type User } from "./api";
+import { clearSession, getUser, type User } from "./api";
 
 type AuthCtx = {
   user: User | null;
@@ -24,7 +24,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
 
   const refresh = () => {
-    setUser(getToken() ? getUser() : null);
+    // The HttpOnly auth cookie isn't visible from JS — we trust the
+    // user-info cookie alone here. /api 401s will trigger clearSession()
+    // and bounce to /login/.
+    setUser(getUser());
   };
 
   useEffect(() => {
@@ -32,8 +35,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setReady(true);
   }, []);
 
-  const signOut = () => {
-    clearSession();
+  const signOut = async () => {
+    await clearSession();
     setUser(null);
     router.push("/login/");
   };

@@ -1,4 +1,4 @@
-import { api, API_URL, getToken } from "./api";
+import { api, API_URL } from "./api";
 import type { ChatDoc, ChatSummary, Message, QueryRequest, Source, ImageItem } from "./chat-types";
 
 export async function listChats(): Promise<ChatSummary[]> {
@@ -40,13 +40,10 @@ export type StreamEvent =
   | { type: "error"; detail: string };
 
 export async function* streamQuery(req: QueryRequest): AsyncGenerator<StreamEvent> {
-  const tok = getToken();
   const res = await fetch(`${API_URL}/query/stream`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(tok ? { Authorization: `Bearer ${tok}` } : {}),
-    },
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",   // sends the HttpOnly grp_jwt cookie
     body: JSON.stringify(req),
   });
   if (!res.ok || !res.body) {

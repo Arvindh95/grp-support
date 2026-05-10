@@ -1,7 +1,8 @@
-// Thin fetch wrapper that injects the JWT and centralises 401 handling.
-// All backend calls in the app go through `api()`.
+// Thin fetch wrapper around the GRP API. Auth is HttpOnly cookie set by the
+// backend on /auth/login — JavaScript never sees the JWT, so XSS that lands
+// in the SPA cannot exfiltrate it. A non-secret `grp_user` cookie carries
+// just the email/role/name for fast UI rendering.
 
-const TOKEN_COOKIE = "grp_jwt";
 const USER_COOKIE = "grp_user";
 
 // Default: same-origin /api proxied by nginx to FastAPI on 127.0.0.1:8000.
@@ -9,12 +10,6 @@ const USER_COOKIE = "grp_user";
 export const API_URL =
   process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") ||
   (typeof window !== "undefined" ? `${window.location.origin}/api` : "/api");
-
-export function getToken(): string | null {
-  if (typeof document === "undefined") return null;
-  const m = document.cookie.match(new RegExp(`(?:^|; )${TOKEN_COOKIE}=([^;]*)`));
-  return m ? decodeURIComponent(m[1]) : null;
-}
 
 export type User = { email: string; role: string; name?: string };
 
@@ -29,18 +24,25 @@ export function getUser(): User | null {
   }
 }
 
-export function setSession(token: string, user: User, hours = 12) {
+export function setSession(_token: string, user: User, hours = 12) {
+  // The JWT is set by the server as an HttpOnly cookie on /auth/login —
+  // we ignore the token argument and only persist the non-secret user
+  // descriptor for navigation/UI.
   const exp = new Date(Date.now() + hours * 3600 * 1000).toUTCString();
-  // `Secure` only sent when page itself is served over HTTPS — keeps localhost
-  // dev (http://localhost:3000) working while production sets it.
   const secure = typeof window !== "undefined" && window.location.protocol === "https:" ? "; Secure" : "";
-  document.cookie = `${TOKEN_COOKIE}=${encodeURIComponent(token)}; path=/; expires=${exp}; SameSite=Lax${secure}`;
   document.cookie = `${USER_COOKIE}=${encodeURIComponent(JSON.stringify(user))}; path=/; expires=${exp}; SameSite=Lax${secure}`;
 }
 
-export function clearSession() {
+export async function clearSession() {
+  // Tell the server to clear the HttpOnly auth cookie, then drop the
+  // user-info cookie locally.
+  try {
+    await fetch(`${API_URL}/auth/logout`, { method: "POST", credentials: "include" });
+  } catch {
+    /* network failure — server-side cookie persists, but client-side
+       clearing below still proceeds so the SPA UI flips to logged-out */
+  }
   const secure = typeof window !== "undefined" && window.location.protocol === "https:" ? "; Secure" : "";
-  document.cookie = `${TOKEN_COOKIE}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax${secure}`;
   document.cookie = `${USER_COOKIE}=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax${secure}`;
 }
 
@@ -58,17 +60,16 @@ type ApiOpts = RequestInit & { skipAuth?: boolean };
 
 export async function api<T = unknown>(path: string, opts: ApiOpts = {}): Promise<T> {
   const headers = new Headers(opts.headers);
-  if (!opts.skipAuth) {
-    const tok = getToken();
-    if (tok) headers.set("Authorization", `Bearer ${tok}`);
-  }
   if (opts.body && !headers.has("Content-Type") && !(opts.body instanceof FormData)) {
     headers.set("Content-Type", "application/json");
   }
-  const res = await fetch(`${API_URL}${path}`, { ...opts, headers });
+  // credentials:"include" sends the HttpOnly grp_jwt cookie; auth flows
+  // entirely through the cookie, no Authorization header from the SPA.
+  const res = await fetch(`${API_URL}${path}`, { ...opts, headers, credentials: "include" });
 
   if (res.status === 401 && !opts.skipAuth) {
-    clearSession();
+    // Server rejected our cookie — drop local user state and bounce to /login/
+    void clearSession();
     if (typeof window !== "undefined" && window.location.pathname !== "/login/") {
       window.location.href = "/login/";
     }
