@@ -464,7 +464,7 @@ def _user_from_api_key(raw_key: str) -> dict | None:
 
 
 def hash_password(pw: str) -> str:
-    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt(rounds=13)).decode()
 
 
 def _check_password_strength(pw: str) -> None:
@@ -703,7 +703,7 @@ def auth_login(req: LoginReq, response: Response) -> dict:
         max_age=JWT_TTL_HOURS * 3600,
         httponly=True,
         secure=True,
-        samesite="lax",
+        samesite="strict",
         path="/",
     )
     return {
@@ -719,7 +719,7 @@ def auth_login(req: LoginReq, response: Response) -> dict:
 
 @app.post("/auth/logout")
 def auth_logout(response: Response) -> dict:
-    response.delete_cookie(SESSION_COOKIE, path="/", samesite="lax", secure=True)
+    response.delete_cookie(SESSION_COOKIE, path="/", samesite="strict", secure=True)
     return {"ok": True}
 
 
@@ -3102,7 +3102,7 @@ def chats_create(req: ChatCreate, user: dict = Depends(current_user)) -> dict:
         auth=ES_AUTH, verify=False, json=doc, timeout=10
     )
     if r.status_code not in (200, 201):
-        raise HTTPException(500, f"Create failed: {r.text[:200]}")
+        raise HTTPException(500, "Failed to create chat")
     return {"id": cid, **doc}
 
 
@@ -3128,7 +3128,7 @@ def chats_update(cid: str, req: ChatUpdate, user: dict = Depends(current_user)) 
     if r.status_code == 404:
         raise HTTPException(404, "Chat not found")
     if r.status_code not in (200, 201):
-        raise HTTPException(500, f"Update failed: {r.text[:200]}")
+        raise HTTPException(500, "Failed to update chat")
     return {"id": cid, "updated_at": now}
 
 
@@ -3142,6 +3142,6 @@ def chats_delete(cid: str, user: dict = Depends(current_user)) -> dict:
     if r.status_code == 404:
         raise HTTPException(404, "Chat not found")
     if r.status_code not in (200, 201):
-        raise HTTPException(500, f"Delete failed: {r.text[:200]}")
+        raise HTTPException(500, "Failed to delete chat")
     return {"ok": True}
 
