@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/alert";
+import { validatePassword } from "@/lib/utils";
 import { api } from "@/lib/api";
 
 export default function ResetPasswordPage() {
@@ -34,8 +35,9 @@ function ResetPasswordInner() {
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
     setError(null);
-    if (pw1.length < 8) {
-      setError("Password must be at least 8 characters.");
+    const pwErr = validatePassword(pw1);
+    if (pwErr) {
+      setError(pwErr);
       return;
     }
     if (pw1 !== pw2) {

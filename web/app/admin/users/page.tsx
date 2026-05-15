@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Alert } from "@/components/ui/alert";
+import { validatePassword, PW_REQ_LABEL } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 
@@ -74,8 +75,9 @@ export default function UsersPage() {
   }
 
   async function onReset(emailTo: string) {
-    if (resetPw.length < 8) {
-      setError("Password must be at least 8 characters.");
+    const pwErr = validatePassword(resetPw);
+    if (pwErr) {
+      setError(pwErr);
       return;
     }
     setBusy(true);
@@ -222,7 +224,7 @@ export default function UsersPage() {
                           <td colSpan={4} className="px-4 py-3">
                             <div className="flex items-end gap-2 max-w-md">
                               <div className="flex-1 space-y-1">
-                                <Label className="text-xs">New password (≥8 chars)</Label>
+                                <Label className="text-xs">New password ({PW_REQ_LABEL})</Label>
                                 <Input
                                   type="password"
                                   value={resetPw}
