@@ -1,17 +1,21 @@
+# Pinned to versions in production env on 2026-05-15.
+# To upgrade: bump a pin, run pip-audit, restart grp-api, verify /health.
+
 # Backend support libs
-requests
-urllib3
-pandas
+requests==2.33.1
+urllib3==2.6.3
+pandas==3.0.2
 
 # Backend (api_server.py — FastAPI/uvicorn on :8000)
-fastapi
-uvicorn
-pydantic
-python-multipart
-anthropic
-bcrypt
-PyJWT
+fastapi==0.135.3
+uvicorn==0.44.0
+pydantic==2.13.0
+python-multipart==0.0.26
+anthropic==0.100.0
+redis==7.4.0
+bcrypt==3.2.2
+PyJWT==2.7.0
 
 # Loaders (load_manuals.py, load_rfs_embed.py) and /upload-document RFS .xlsx ingest
-xlrd
-openpyxl
+xlrd==2.0.2
+openpyxl==3.1.5

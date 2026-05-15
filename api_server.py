@@ -27,6 +27,7 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 ANTHROPIC_MODEL   = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 JWT_SECRET  = os.environ["JWT_SECRET"]
 JWT_ALG     = "HS256"
+IMG_SIGNING_KEY = os.environ.get("IMG_SIGNING_KEY", "").encode() or None
 JWT_TTL_HOURS = int(os.environ.get("JWT_TTL_HOURS", "12"))
 IMG_BASE    = os.environ.get("IMG_BASE",    "http://173.212.247.3:8080")
 IMG_DIR     = os.environ.get("IMG_DIR",     "/opt/grp-manuals/Doc-Images")
@@ -65,10 +66,11 @@ DOCUMENT_UPLOAD_MAX_BYTES = int(os.environ.get("DOCUMENT_UPLOAD_MAX_BYTES",
                                                 str(30 * 1024 * 1024)))
 # Per-doc-type allowed extensions for /upload-document.
 DOCUMENT_UPLOAD_EXTS = {
-    "manual": {".docx", ".md"},
-    "rfs":    {".xlsx", ".xls", ".csv"},
-    "script": {".txt", ".sql"},
-    "code":   {".py", ".cs", ".sql"},
+    "manual":    {".docx", ".md"},
+    "rfs":       {".xlsx", ".xls", ".csv"},
+    "script":    {".txt", ".sql"},
+    "code":      {".py", ".cs", ".sql"},
+    "acumatica": {".docx", ".md"},
 }
 
 RFS_INDICES = [
@@ -76,9 +78,10 @@ RFS_INDICES = [
     "rfs-tickets-feb-2025",
     "rfs-tickets-mar-2025",
 ]
-SCRIPTS_INDEX = "grp-scripts"
-CODE_INDEX    = "grp-code"
-CHATS_INDEX   = "grp-chats"
+SCRIPTS_INDEX   = "grp-scripts"
+CODE_INDEX      = "grp-code"
+ACUMATICA_INDEX = "acumatica-help"
+CHATS_INDEX     = "grp-chats"
 USERS_INDEX   = "grp-users"
 AUDIT_INDEX   = "grp-audit"
 
@@ -206,6 +209,30 @@ RFS_MAPPING = {
     }
 }
 
+# Acumatica help index uses same shape as grp-manuals (heading-chunked sections
+# with embedded screenshots and screen codes like AP301000).
+ACUMATICA_MAPPING = {
+    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+    "mappings": {
+        "properties": {
+            "module":          {"type": "keyword"},
+            "section":         {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+            "subsection":      {"type": "text"},
+            "content":         {"type": "text", "analyzer": "standard"},
+            "screen_codes":    {"type": "keyword"},
+            "images":          {"type": "keyword"},
+            "image_captions":  {"type": "text"},
+            "chunk_index":     {"type": "integer"},
+            "total_chunks":    {"type": "integer"},
+            "prev_section":    {"type": "keyword"},
+            "next_section":    {"type": "keyword"},
+            "prev_tail":       {"type": "text"},
+            "source_file":     {"type": "keyword"},
+            "embedding":       {"type": "dense_vector", "dims": 1024, "index": True, "similarity": "cosine"}
+        }
+    }
+}
+
 # ── Agent System Prompt ─────────────────────────────────────────────────────────
 AGENT_SYSTEM_PROMPT = """You are GRP ERP Support AI — a search-first support agent for CENSOF internal support engineers (Century Software, Malaysia).
 You are the PRIMARY search agent. You drive all retrieval via Elasticsearch search tools. Do not rely solely on initial context — always search.
@@ -259,6 +286,11 @@ Index: grp-code  (code files — Python, C#, SQL — for reference)
   language    : "python" | "csharp" | "sql"
   filename    : file name
 
+Index: acumatica-help  (Official Acumatica ERP help documentation, chunked by heading)
+  Same shape as grp-manuals (module, section, subsection, content, screen_codes, images, image_captions).
+  Source: Acumatica's official end-user / implementation / developer guides (AccountsPayable, GeneralLedger, FixedAssets, FrameworkDevelopmentGuide, etc.).
+  Use as a FALLBACK to grp-manuals: GRP is the Malaysianised fork of Acumatica, so vanilla Acumatica behaviour applies wherever GRP did not customise. Prefer grp-manuals when both have a hit.
+
 === MANDATORY SEARCH PROTOCOL ===
 Before answering, you MUST search. Follow this order:
 
@@ -268,25 +300,26 @@ Before answering, you MUST search. Follow this order:
    - If first index has few results, still check the others
 3. Search grp-scripts if the question involves a data issue, system error, or fix request
 4. Search grp-code if question involves code logic, customization, or scripts
+4b. If grp-manuals returned 0-1 results for a procedure / how-to question, ALSO search acumatica-help with the same terms. Acumatica's vanilla behaviour usually still applies to GRP. Cite manual hits from acumatica-help as source type "acumatica".
 5. If first search returns 0-1 results, RETRY with:
    - Alternative keywords (synonyms, Malay/English equivalents)
    - Specific proper nouns mentioned (e.g. "JomPay", "TNB", bank names)
    - Screen codes if applicable (AP301000, PR201000, GL102000, etc.)
 6. Minimum: attempt at least 3 MCP searches per query before synthesizing answer
 
-7. CROSS-LINK TICKETS ↔ MANUALS: RFS tickets do not store screenshots, but the manual does. When a ticket mentions a screen code (e.g. AP303000) or a procedure name (e.g. "vendor registration", "void payment", "credit memo"), you MUST also search grp-manuals for that screen_code or section. Embed the manual's inline screenshots in your troubleshooting answer so the user sees the screen they are working on. Examples:
+7. CROSS-LINK TICKETS ↔ MANUALS: RFS tickets do not store screenshots, but manual indices do. When a ticket mentions a screen code (e.g. AP303000) or a procedure name (e.g. "vendor registration", "void payment", "credit memo"), you MUST also search the manual indices (grp-manuals first, then acumatica-help if grp-manuals is thin) for that screen_code or section. Embed the manual's inline screenshots in your troubleshooting answer so the user sees the screen they are working on. Examples:
    - Ticket about a vendor registration bug → search grp-manuals: { "query": { "match": { "section": "Daftar Pembekal" } } } and inline its screenshots.
-   - Ticket mentions AP301000 → search grp-manuals: { "query": { "term": { "screen_codes": "AP301000" } } } and inline its screenshots.
-   This cross-linking is mandatory whenever a ticket references a screen or procedure that exists in grp-manuals.
+   - Ticket mentions AP301000 → search grp-manuals: { "query": { "term": { "screen_codes": "AP301000" } } } — if grp-manuals returns nothing, retry the same query on acumatica-help.
+   This cross-linking is mandatory whenever a ticket references a screen or procedure that exists in either manual index.
 
-8. SIBLING-FETCH FOR PARTIAL SECTIONS: Manual sections are split into smaller chunks. If a grp-manuals hit has `subsection` containing "(part N/M)" — meaning it is one piece of a larger procedure — you MUST fetch ALL siblings to assemble the full procedure before answering. Run:
+8. SIBLING-FETCH FOR PARTIAL SECTIONS: Manual sections in BOTH grp-manuals AND acumatica-help are split into smaller chunks. If a hit from EITHER index has `subsection` containing "(part N/M)" — meaning it is one piece of a larger procedure — you MUST fetch ALL siblings from the SAME index as the hit before answering. Run the following query against whichever index the partial hit came from (grp-manuals OR acumatica-help):
    {
      "query": { "term": { "section.keyword": "<exact section name from hit>" } },
      "sort": [{ "chunk_index": "asc" }],
      "size": 30,
      "_source": ["module","section","subsection","content","images","image_captions","screen_codes"]
    }
-   Stitch the parts in order (part 1/M, 2/M, ...) into one continuous procedure. Inline images stay where they appear in each part. Without sibling-fetch, your answer will be incomplete and may skip steps or screenshots.
+   Stitch the parts in order (part 1/M, 2/M, ...) into one continuous procedure. Inline images stay where they appear in each part. Do NOT cross indices when fetching siblings — chunks belong to one index only. Without sibling-fetch, your answer will be incomplete and may skip steps or screenshots.
 
 === ELASTICSEARCH QUERY FORMAT ===
 BM25 (keyword) search:
@@ -337,7 +370,7 @@ For each relevant past ticket found:
 At the END of your response, output this block so the system can display images and sources:
 
 ```sources
-{"manuals":[{"module":"MODULE_NAME","section":"SECTION_NAME"}],"tickets":[{"referno":"REFNO","index":"rfs-tickets-jan-2025"}],"scripts":[{"purpose":"PURPOSE"}]}
+{"manuals":[{"module":"MODULE_NAME","section":"SECTION_NAME"}],"acumatica":[{"module":"MODULE_NAME","section":"SECTION_NAME"}],"tickets":[{"referno":"REFNO","index":"rfs-tickets-jan-2025"}],"scripts":[{"purpose":"PURPOSE"}]}
 ```
 
 Only include sources you actually used. Empty arrays [] if none. This block is hidden from the user.
@@ -348,10 +381,10 @@ app = FastAPI(title="GRP Support AI API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://173.212.247.3.nip.io",  # production HTTPS via nip.io
-        "http://localhost:3000",          # Next.js dev server
-    ],
+    allow_origins=[o.strip() for o in os.environ.get(
+        "CORS_ALLOWED_ORIGINS",
+        "https://173.212.247.3.nip.io",
+    ).split(",") if o.strip()],
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,  # required so the browser sends the HttpOnly auth cookie
@@ -364,7 +397,8 @@ def startup():
     for idx, mapping in [(CODE_INDEX, CODE_MAPPING), (CHATS_INDEX, CHATS_MAPPING),
                          (USERS_INDEX, USERS_MAPPING), (AUDIT_INDEX, AUDIT_MAPPING),
                          (API_KEYS_INDEX, API_KEYS_MAPPING),
-                         (RESET_TOKENS_INDEX, RESET_TOKENS_MAPPING)]:
+                         (RESET_TOKENS_INDEX, RESET_TOKENS_MAPPING),
+                         (ACUMATICA_INDEX, ACUMATICA_MAPPING)]:
         r = requests.get(f"{ES_URL}/{idx}", auth=ES_AUTH, verify=False)
         if r.status_code == 404:
             requests.put(f"{ES_URL}/{idx}", json=mapping,
@@ -431,6 +465,20 @@ def _user_from_api_key(raw_key: str) -> dict | None:
 
 def hash_password(pw: str) -> str:
     return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+
+
+def _check_password_strength(pw: str) -> None:
+    """Reject weak passwords. >=12 chars, >=3 of [lower/upper/digit/symbol]."""
+    if len(pw) < 12:
+        raise HTTPException(400, "Password must be at least 12 characters")
+    classes = sum([
+        any(c.islower() for c in pw),
+        any(c.isupper() for c in pw),
+        any(c.isdigit() for c in pw),
+        any(not c.isalnum() for c in pw),
+    ])
+    if classes < 3:
+        raise HTTPException(400, "Password must include 3 of: lowercase, uppercase, digit, symbol")
 
 
 def verify_password(pw: str, hashed: str) -> bool:
@@ -562,6 +610,65 @@ def require_admin(user: dict = Depends(current_user)) -> dict:
     return user
 
 
+# Login lockout — Redis-backed so it works across uvicorn workers.
+# Fails open if Redis is down (logs warning) — we'd rather let valid users in
+# than DoS them on an infra blip.
+import redis as _redis_mod
+LOGIN_FAIL_THRESHOLD = int(os.environ.get("LOGIN_FAIL_THRESHOLD", "5"))
+LOGIN_FAIL_WINDOW    = int(os.environ.get("LOGIN_FAIL_WINDOW", "600"))
+LOGIN_LOCK_DURATION  = int(os.environ.get("LOGIN_LOCK_DURATION", "900"))
+REDIS_URL            = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+try:
+    _redis = _redis_mod.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=2)
+    _redis.ping()
+except Exception as _e:
+    _redis = None
+
+
+def _check_login_lockout(email: str) -> None:
+    if _redis is None:
+        return
+    try:
+        ttl = _redis.ttl(f"grp:login:locked:{email}")
+    except Exception:
+        return
+    if ttl and ttl > 0:
+        raise HTTPException(
+            429, f"Account temporarily locked. Retry in {ttl}s.",
+            headers={"Retry-After": str(ttl)},
+        )
+
+
+def _record_login_failure(email: str) -> None:
+    if _redis is None:
+        return
+    try:
+        key = f"grp:login:fails:{email}"
+        pipe = _redis.pipeline()
+        pipe.incr(key)
+        pipe.expire(key, LOGIN_FAIL_WINDOW)
+        count, _ = pipe.execute()
+        if int(count) >= LOGIN_FAIL_THRESHOLD:
+            _redis.set(f"grp:login:locked:{email}", "1", ex=LOGIN_LOCK_DURATION)
+            _redis.delete(key)
+            try:
+                log_kv("warning", "login-lockout", email=email, dur_s=LOGIN_LOCK_DURATION)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _record_login_success(email: str) -> None:
+    if _redis is None:
+        return
+    try:
+        _redis.delete(f"grp:login:fails:{email}", f"grp:login:locked:{email}")
+    except Exception:
+        pass
+
+
+
 class LoginReq(BaseModel):
     email:    str
     password: str
@@ -578,9 +685,12 @@ class RegisterReq(BaseModel):
 
 @app.post("/auth/login")
 def auth_login(req: LoginReq, response: Response) -> dict:
+    _check_login_lockout(req.email)
     user = get_user_by_email(req.email)
     if not user or not verify_password(req.password, user.get("password_hash", "")):
+        _record_login_failure(req.email)
         raise HTTPException(401, "Invalid credentials")
+    _record_login_success(req.email)
     role = user.get("role", "user")
     tv = int(user.get("token_version", 0))
     token = make_token(req.email, role, tv)
@@ -722,21 +832,20 @@ def auth_reset_request(req: ResetRequestReq) -> dict:
             f"{ES_URL}/{RESET_TOKENS_INDEX}/_doc?refresh=true",
             auth=ES_AUTH, verify=False, json=doc, timeout=10,
         )
-        send_email(
+        _threading.Thread(target=send_email, args=(
             req.email,
             "Reset your GRP Support AI password",
             f"Hi,\n\n"
             f"A password reset was requested for your account.\n\n"
             f"Reset link (valid 1 hour): {FRONTEND_URL}/reset-password/?token={raw}\n\n"
             f"If you did not request this, ignore this message.\n",
-        )
+        ), daemon=True).start()
     return {"ok": True}
 
 
 @app.post("/auth/reset-confirm")
 def auth_reset_confirm(req: ResetConfirmReq) -> dict:
-    if len(req.new_password) < 8:
-        raise HTTPException(400, "Password must be at least 8 characters")
+    _check_password_strength(req.new_password)
     h = _sha256_hex(req.token)
     r = requests.post(
         f"{ES_URL}/{RESET_TOKENS_INDEX}/_search",
@@ -838,8 +947,7 @@ def auth_change_password(req: ChangePasswordReq, user: dict = Depends(current_us
     src = get_user_by_email(user["email"])
     if not src or not verify_password(req.old_password, src.get("password_hash", "")):
         raise HTTPException(401, "Invalid credentials")
-    if len(req.new_password) < 8:
-        raise HTTPException(400, "Password must be at least 8 characters")
+    _check_password_strength(req.new_password)
     r = requests.post(
         f"{ES_URL}/{USERS_INDEX}/_update_by_query?refresh=true",
         auth=ES_AUTH, verify=False,
@@ -896,8 +1004,7 @@ def auth_delete_user(email: str, admin: dict = Depends(require_admin)) -> dict:
 def auth_reset_password(email: str, req: ResetPasswordReq) -> dict:
     if not get_user_by_email(email):
         raise HTTPException(404, "User not found")
-    if len(req.new_password) < 8:
-        raise HTTPException(400, "Password must be at least 8 characters")
+    _check_password_strength(req.new_password)
     r = requests.post(
         f"{ES_URL}/{USERS_INDEX}/_update_by_query?refresh=true",
         auth=ES_AUTH, verify=False,
@@ -1022,7 +1129,7 @@ def _sign_image(path: str, ttl: int | None = None) -> str:
     ttl = IMG_SIGN_TTL if ttl is None else ttl
     exp = int(_time.time()) + max(60, ttl)
     msg = f"{path}|{exp}".encode()
-    sig = _hmac.new(JWT_SECRET.encode(), msg, _hashlib.sha256).hexdigest()[:32]
+    sig = _hmac.new(IMG_SIGNING_KEY or JWT_SECRET.encode(), msg, _hashlib.sha256).hexdigest()[:32]
     encoded = _url_quote(path, safe="/")
     return f"{IMG_PUBLIC_BASE}/{encoded}?sig={sig}&exp={exp}"
 
@@ -1031,7 +1138,7 @@ def _verify_image_sig(path: str, sig: str, exp: int) -> bool:
     if exp < int(_time.time()):
         return False
     msg = f"{path}|{exp}".encode()
-    expected = _hmac.new(JWT_SECRET.encode(), msg, _hashlib.sha256).hexdigest()[:32]
+    expected = _hmac.new(IMG_SIGNING_KEY or JWT_SECRET.encode(), msg, _hashlib.sha256).hexdigest()[:32]
     return _hmac.compare_digest(sig, expected)
 
 
@@ -1546,8 +1653,9 @@ def _build_rfs_embed_text(ticket: dict) -> str:
     return re.sub(r'\s+', ' ', text).strip()[:4000]
 
 
-def _find_section_doc(module: str, section: str) -> tuple[str | None, dict | None]:
-    """Find ES doc _id and source for a given module+section."""
+def _find_section_doc(module: str, section: str,
+                       index: str = "grp-manuals") -> tuple[str | None, dict | None]:
+    """Find ES doc _id and source for a given module+section in `index`."""
     body = {
         "size": 1,
         "_source": ["module", "section", "images", "image_captions"],
@@ -1558,16 +1666,14 @@ def _find_section_doc(module: str, section: str) -> tuple[str | None, dict | Non
             }
         }
     }
-    r = requests.post(f"{ES_URL}/grp-manuals/_search",
+    r = requests.post(f"{ES_URL}/{index}/_search",
                       auth=ES_AUTH, verify=False, json=body, timeout=5)
     hits = r.json().get("hits", {}).get("hits", [])
     if hits:
         return hits[0]["_id"], hits[0]["_source"]
     # Fallback: match only on section
-    body["query"] = {"match_phrase": {"section": section}}
-    del body["query"]
     body["query"] = {"match": {"section": section}}
-    r = requests.post(f"{ES_URL}/grp-manuals/_search",
+    r = requests.post(f"{ES_URL}/{index}/_search",
                       auth=ES_AUTH, verify=False, json=body, timeout=5)
     hits = r.json().get("hits", {}).get("hits", [])
     if hits:
@@ -1623,9 +1729,10 @@ def _knn_search(index: str, embedding: list[float], top_k: int,
 
 def get_seed_context(embedding: list[float]) -> tuple[str, int]:
     seed_k = 3
-    manual_hits = _knn_search("grp-manuals", embedding, seed_k, MANUAL_FIELDS)
-    script_hits = _knn_search(SCRIPTS_INDEX, embedding, seed_k, SCRIPT_FIELDS)
-    code_hits   = _knn_search(CODE_INDEX, embedding, seed_k, CODE_FIELDS)
+    manual_hits    = _knn_search("grp-manuals",    embedding, seed_k, MANUAL_FIELDS)
+    acumatica_hits = _knn_search(ACUMATICA_INDEX,  embedding, seed_k, MANUAL_FIELDS)
+    script_hits    = _knn_search(SCRIPTS_INDEX,    embedding, seed_k, SCRIPT_FIELDS)
+    code_hits      = _knn_search(CODE_INDEX,       embedding, seed_k, CODE_FIELDS)
 
     ticket_hits = []
     for idx in RFS_INDICES:
@@ -1670,6 +1777,20 @@ def get_seed_context(embedding: list[float]) -> tuple[str, int]:
                 txt += f"HAS SCREENSHOTS: Yes ({len(s['images'])} images)\n"
             parts.append(txt)
 
+    if acumatica_hits:
+        parts.append("=== ACUMATICA HELP SECTIONS (semantic seed — fallback to GRP) ===")
+        for h in acumatica_hits:
+            s = h["_source"]
+            txt = f"MODULE: {s.get('module','')}\nSECTION: {s.get('section','')}\n"
+            if s.get("screen_codes"):
+                txt += f"SCREEN CODES: {', '.join(s['screen_codes'])}\n"
+            txt += f"CONTENT:\n{s.get('content','')[:500]}\n"
+            if s.get("image_captions"):
+                txt += f"IMAGE CAPTIONS: {' | '.join(s['image_captions'])}\n"
+            if s.get("images"):
+                txt += f"HAS SCREENSHOTS: Yes ({len(s['images'])} images)\n"
+            parts.append(txt)
+
     if ticket_hits:
         parts.append("=== SIMILAR PAST RFS TICKETS (semantic seed) ===")
         for h in ticket_hits:
@@ -1683,7 +1804,8 @@ def get_seed_context(embedding: list[float]) -> tuple[str, int]:
                 txt += f"ACTIONS/NOTES: {str(s['action_summary'])[:400]}\n"
             parts.append(txt)
 
-    seed_count = len(manual_hits) + len(ticket_hits) + len(script_hits) + len(code_hits)
+    seed_count = (len(manual_hits) + len(acumatica_hits) + len(ticket_hits)
+                  + len(script_hits) + len(code_hits))
     return "\n---\n".join(parts), seed_count
 
 
@@ -1745,6 +1867,7 @@ _KNOWLEDGE_INDICES: set[str] = {
     "grp-manuals",
     SCRIPTS_INDEX,
     CODE_INDEX,
+    ACUMATICA_INDEX,
     *RFS_INDICES,
 }
 
@@ -1941,7 +2064,8 @@ def parse_sources_block(raw: str) -> tuple[str, dict]:
     return SOURCES_RE.sub('', raw).strip(), sources_dict
 
 
-def fetch_images_for_sections(manuals: list[dict]) -> list[dict]:
+def fetch_images_for_sections(manuals: list[dict],
+                               index: str = "grp-manuals") -> list[dict]:
     images = []
     seen = set()
     for ref in manuals:
@@ -1950,7 +2074,7 @@ def fetch_images_for_sections(manuals: list[dict]) -> list[dict]:
         if not section:
             continue
         try:
-            doc_id, src = _find_section_doc(module, section)
+            doc_id, src = _find_section_doc(module, section, index=index)
             if src:
                 img_list = src.get("images", [])
                 cap_list = src.get("image_captions", [])
@@ -1975,6 +2099,9 @@ def build_sources_from_dict(sources_dict: dict) -> list[Source]:
     for m in sources_dict.get("manuals", []):
         sources.append(Source(type="manual", index="grp-manuals",
                               module=m.get("module"), section=m.get("section")))
+    for a in sources_dict.get("acumatica", []):
+        sources.append(Source(type="acumatica", index=ACUMATICA_INDEX,
+                              module=a.get("module"), section=a.get("section")))
     for t in sources_dict.get("tickets", []):
         sources.append(Source(type="ticket",
                               index=t.get("index", "rfs-tickets"),
@@ -1995,7 +2122,7 @@ def health():
 @app.get("/indices", dependencies=[Depends(current_user)])
 def list_indices():
     result = {}
-    for idx in ["grp-manuals", SCRIPTS_INDEX, CODE_INDEX] + RFS_INDICES:
+    for idx in ["grp-manuals", ACUMATICA_INDEX, SCRIPTS_INDEX, CODE_INDEX] + RFS_INDICES:
         try:
             r = requests.get(f"{ES_URL}/{idx}/_count", auth=ES_AUTH,
                              verify=False, timeout=5)
@@ -2057,7 +2184,12 @@ def query(req: QueryRequest, user: dict = Depends(current_user)):
 
     answer, sources_dict = parse_sources_block(raw_answer)
     answer = _sign_text_images(answer)
-    images  = fetch_images_for_sections(sources_dict.get("manuals", [])) if req.include_images else []
+    if req.include_images:
+        images = fetch_images_for_sections(sources_dict.get("manuals", []))
+        images += fetch_images_for_sections(sources_dict.get("acumatica", []),
+                                            index=ACUMATICA_INDEX)
+    else:
+        images = []
     sources = build_sources_from_dict(sources_dict)
 
     write_audit(user["email"], "query",
@@ -2152,7 +2284,12 @@ def _stream_claude_agent(user_email: str, req: QueryRequest):
             full = "".join(final_text_parts)
             answer, sources_dict = parse_sources_block(full)
             answer = _sign_text_images(answer)
-            images  = fetch_images_for_sections(sources_dict.get("manuals", [])) if req.include_images else []
+            if req.include_images:
+                images = fetch_images_for_sections(sources_dict.get("manuals", []))
+                images += fetch_images_for_sections(sources_dict.get("acumatica", []),
+                                                    index=ACUMATICA_INDEX)
+            else:
+                images = []
             sources = build_sources_from_dict(sources_dict)
             yield _sse("done", {
                 "answer":       answer,
@@ -2267,7 +2404,7 @@ def _file_field_for_index(index_name: str) -> str:
 @app.get("/knowledge-base", dependencies=[Depends(current_user)])
 def knowledge_base_summary() -> dict:
     """All indices with doc counts + file list in one call."""
-    all_indices = ["grp-manuals", SCRIPTS_INDEX, CODE_INDEX] + RFS_INDICES
+    all_indices = ["grp-manuals", ACUMATICA_INDEX, SCRIPTS_INDEX, CODE_INDEX] + RFS_INDICES
     result = {}
     for idx in all_indices:
         count_r = requests.get(f"{ES_URL}/{idx}/_count",
@@ -2363,7 +2500,7 @@ def reindex(index_name: str) -> dict:
     for hit in hits:
         s = hit["_source"]
         # Build embed text based on index type
-        if index_name == "grp-manuals":
+        if index_name in ("grp-manuals", ACUMATICA_INDEX):
             text = f"{s.get('module','')} {s.get('section','')} {s.get('content','')}"[:4000]
         elif index_name in [SCRIPTS_INDEX, CODE_INDEX]:
             text = f"{s.get('purpose','')} {s.get('content','')}"[:4000]
@@ -2388,6 +2525,7 @@ def search(q: str = Query(...), index: str = Query(...), size: int = 10) -> list
     _require_knowledge_index(index)
     all_text_fields = {
         "grp-manuals":    ["content^2", "section^3", "module^2", "image_captions"],
+        ACUMATICA_INDEX:  ["content^2", "section^3", "module^2", "image_captions"],
         SCRIPTS_INDEX:    ["purpose^3", "content^2", "tables^2"],
         CODE_INDEX:       ["purpose^3", "content^2"],
     }
@@ -2473,7 +2611,7 @@ def rename_section(
 @app.post("/upload-document", dependencies=[Depends(require_admin)])
 async def upload_document(
     file:     UploadFile = File(...),
-    doc_type: str = Form(...),   # manual | rfs | script | code
+    doc_type: str = Form(...),   # manual | rfs | script | code | acumatica
     metadata: str = Form("{}"),
 ) -> dict:
     try:
@@ -2508,6 +2646,8 @@ async def upload_document(
         return _handle_script(content_bytes, file.filename, meta)
     elif doc_type == "code":
         return _handle_code(content_bytes, file.filename, meta)
+    elif doc_type == "acumatica":
+        return _handle_acumatica(content_bytes, file.filename, meta)
 
 
 # Match Images/<stem>/[media/]file regardless of any prefix (tmp dir, MD/, etc.)
@@ -2631,6 +2771,64 @@ def _handle_manual(content_bytes: bytes, filename: str, meta: dict) -> dict:
             errors += 1
 
     return {"chunks_indexed": indexed, "errors": errors, "index": "grp-manuals"}
+
+
+def _handle_acumatica(content_bytes: bytes, filename: str, meta: dict) -> dict:
+    """Index official Acumatica help docs into acumatica-help.
+    Same chunking pipeline as _handle_manual; only the target index differs."""
+    if filename.lower().endswith(".docx"):
+        text = _docx_to_md(content_bytes, filename)
+        filename = re.sub(r'\.docx$', '.md', filename, flags=re.IGNORECASE)
+    else:
+        text = content_bytes.decode("utf-8", errors="replace")
+    _, body = _parse_frontmatter(text)
+    module = meta.get("module") or _extract_module_name(filename)
+    chunks = _chunk_by_headings(body, module, filename)
+
+    if not chunks:
+        raise HTTPException(400, "No sections found in file")
+
+    if not meta.get("confirm", False):
+        preview = [
+            {
+                "original_section": c["section"],
+                "section": c["section"],
+                "content_preview": c["content"][:120],
+                "image_count": len(c["images"])
+            }
+            for c in chunks
+        ]
+        return {"preview": preview, "module": module, "chunks": len(chunks)}
+
+    overrides = meta.get("overrides", {})
+    module_override = meta.get("module") or module
+    for c in chunks:
+        if c["section"] in overrides:
+            c["section"] = overrides[c["section"]]
+        c["module"] = module_override
+
+    requests.post(
+        f"{ES_URL}/{ACUMATICA_INDEX}/_delete_by_query",
+        auth=ES_AUTH, verify=False, timeout=30,
+        json={"query": {"term": {"source_file": filename}}}
+    )
+
+    indexed, errors = 0, 0
+    for chunk in chunks:
+        try:
+            embedding = get_embedding(chunk["_embed_text"])
+            doc = {k: v for k, v in chunk.items() if not k.startswith("_")}
+            doc["embedding"] = embedding
+            r = requests.post(f"{ES_URL}/{ACUMATICA_INDEX}/_doc",
+                              auth=ES_AUTH, verify=False, json=doc, timeout=30)
+            if r.status_code in (200, 201):
+                indexed += 1
+            else:
+                errors += 1
+        except Exception:
+            errors += 1
+
+    return {"chunks_indexed": indexed, "errors": errors, "index": ACUMATICA_INDEX}
 
 
 def _handle_rfs(content_bytes: bytes, filename: str, meta: dict) -> dict:
