@@ -48,4 +48,4 @@ jobs:
             sudo systemctl restart grp-api
             sleep 3
             curl -fsS http://127.0.0.1:8000/health
-            curl -fsS -o /dev/null http://127.0.0.1:8081/login/
+            curl -fsSk -o /dev/null https://173.212.247.3.nip.io/login/
