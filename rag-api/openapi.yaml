@@ -1,0 +1,504 @@
+openapi: 3.1.0
+info:
+  title: GRP RAG-API
+  version: 0.1.0
+  description: |
+    Multi-agent RAG service. Source apps submit an RFS (support ticket payload),
+    a 5-agent Claude pipeline analyses it against the knowledge base, the caller
+    receives structured analysis with citations.
+
+    Submission is asynchronous. The response from `POST /rfs/analyze` is a
+    `job_id`. Callers either poll `GET /jobs/{id}` or supply a `callback_url`
+    on submit and receive an HMAC-signed webhook when the job completes.
+
+    All endpoints require API-key auth. Keys are minted by the grp-api admin
+    surface; the RAG-API trusts the same key store.
+
+servers:
+  - url: https://173.212.247.3.nip.io/rag
+    description: Production (nginx-fronted)
+  - url: http://127.0.0.1:8001
+    description: Loopback (dev)
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: rfs
+    description: RFS submission + retrieval
+  - name: jobs
+    description: Job lifecycle
+  - name: meta
+    description: Health, readiness, metadata
+
+paths:
+  /rfs/analyze:
+    post:
+      tags: [rfs]
+      summary: Submit an RFS for analysis
+      description: |
+        Returns `202 Accepted` with a `job_id`. The job runs asynchronously.
+
+        **Idempotency.** Provide an `Idempotency-Key` header (caller-chosen UUID).
+        A second submission with the same key within 24h returns the original
+        `job_id` instead of creating a new job. Different body with same key →
+        `409 Conflict`.
+
+        **Rate limit.** Per API key, default 60 req/min. Response includes
+        `RateLimit-*` headers (draft-ietf-httpapi-ratelimit-headers).
+      operationId: submitRFS
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RFSAnalyzeRequest'
+      responses:
+        '202':
+          description: Accepted; job queued.
+          headers:
+            Location:
+              schema: { type: string }
+              description: URL of the job resource (`/jobs/{id}`).
+            RateLimit-Limit:    { schema: { type: integer } }
+            RateLimit-Remaining: { schema: { type: integer } }
+            RateLimit-Reset:    { schema: { type: integer } }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobAccepted'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/IdempotencyConflict' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /jobs/{id}:
+    get:
+      tags: [jobs]
+      summary: Get job status / result
+      operationId: getJob
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Job exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /jobs/{id}/cancel:
+    post:
+      tags: [jobs]
+      summary: Cancel a queued or running job
+      description: Admin-only. Running jobs may complete one in-flight agent step before cancelling.
+      operationId: cancelJob
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Cancel requested.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Job already in a terminal state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      tags: [meta]
+      summary: Liveness probe
+      security: []
+      operationId: health
+      responses:
+        '200':
+          description: Process alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+
+  /ready:
+    get:
+      tags: [meta]
+      summary: Dependency readiness probe
+      security: []
+      operationId: ready
+      responses:
+        '200':
+          description: All deps reachable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+        '503':
+          description: One or more deps not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: |
+        Send as `Authorization: ApiKey grp_<token>`. Keys are minted via
+        grp-api `POST /api-keys`. The RAG-API validates against the same
+        ES-backed key store.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: Caller-chosen UUID. Required for at-least-once safety on retries.
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing or invalid API key.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: API key lacks scope.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource does not exist.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PayloadTooLarge:
+      description: Body exceeds size limit (default 256 KiB).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Rate limit exceeded.
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    IdempotencyConflict:
+      description: Idempotency-Key reused with different payload.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+
+    RFSAnalyzeRequest:
+      type: object
+      required: [rfs]
+      properties:
+        rfs:
+          $ref: '#/components/schemas/RFS'
+        callback_url:
+          type: string
+          format: uri
+          description: HTTPS URL. Webhook POST when job completes (success or failure).
+        callback_secret_hint:
+          type: string
+          minLength: 8
+          maxLength: 64
+          description: |
+            Caller-supplied label resolving to a pre-shared HMAC secret.
+            The RAG-API signs the webhook body with the resolved secret.
+            Secrets are registered out-of-band by an admin (`/admin/callback-secrets`,
+            not part of v1 spec).
+        priority:
+          type: string
+          enum: [low, normal, high]
+          default: normal
+        client_metadata:
+          type: object
+          additionalProperties: true
+          description: Free-form caller-supplied context. Echoed back in the job.
+          maxProperties: 32
+
+    RFS:
+      type: object
+      required: [lodge_id, notes]
+      description: |
+        Mirrors the ES `rfs-tickets-*` ticket shape. Required fields are the
+        minimum needed for the Classifier to act. Everything else improves
+        retrieval quality.
+      properties:
+        lodge_id:     { type: string, description: Unique ticket id from source system. }
+        referno:      { type: string }
+        branch_id:    { type: string }
+        timestamp:    { type: string, format: date-time }
+        serviceid:    { type: string }
+        clientid:     { type: string }
+        projectid:    { type: string }
+        probtypeid:   { type: string }
+        probareaid:   { type: string }
+        relatedarea:  { type: string }
+        priority:     { type: integer, minimum: 0, maximum: 9 }
+        notes:
+          type: string
+          description: Free-text problem description from the user.
+          minLength: 1
+          maxLength: 16000
+        contactname:  { type: string }
+        contactemail: { type: string, format: email }
+        attachments:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/Attachment'
+        actions:
+          type: array
+          description: Prior action log on the ticket (notes, escalations).
+          items:
+            $ref: '#/components/schemas/Action'
+
+    Attachment:
+      type: object
+      required: [filename, content_type, sha256, bytes]
+      properties:
+        filename:     { type: string }
+        content_type: { type: string }
+        sha256:       { type: string, pattern: '^[a-f0-9]{64}$' }
+        bytes:        { type: integer, minimum: 0 }
+        url:
+          type: string
+          format: uri
+          description: HTTPS URL the RAG-API can fetch (signed, short-lived).
+
+    Action:
+      type: object
+      required: [type, timestamp]
+      properties:
+        type:      { type: string, enum: [Lodge, Assign, Note, Close, Attach, Escalate, Edit] }
+        timestamp: { type: string, format: date-time }
+        userid:    { type: string }
+        note:      { type: string }
+
+    JobAccepted:
+      type: object
+      required: [job_id, status]
+      properties:
+        job_id: { type: string, format: uuid }
+        status: { type: string, enum: [queued] }
+        poll_url:
+          type: string
+          format: uri
+          description: Convenience — same as Location header.
+        estimated_seconds:
+          type: integer
+          description: Best-effort ETA based on queue depth + priority.
+
+    Job:
+      type: object
+      required: [job_id, status, created_at, updated_at]
+      properties:
+        job_id: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [queued, running, succeeded, failed, cancelled, expired]
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+        rfs_lodge_id: { type: string }
+        priority: { type: string, enum: [low, normal, high] }
+        client_metadata: { type: object, additionalProperties: true }
+        result:
+          $ref: '#/components/schemas/Analysis'
+          description: Present when status = succeeded.
+        error:
+          $ref: '#/components/schemas/Error'
+          description: Present when status = failed.
+        agent_trace:
+          type: array
+          description: |
+            Per-agent execution record. Order matches pipeline. Useful for
+            debugging and audit. Omits raw prompts; includes token counts +
+            cache hits.
+          items:
+            $ref: '#/components/schemas/AgentStep'
+        usage:
+          $ref: '#/components/schemas/Usage'
+
+    Analysis:
+      type: object
+      required: [category, summary, recommended_actions, citations]
+      description: Final structured analysis produced by the Formatter agent.
+      properties:
+        category:
+          type: string
+          description: Issue category from Classifier (e.g., "license-error", "data-import").
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        summary:
+          type: string
+          description: 1–3 sentence problem restatement in plain English.
+          maxLength: 600
+        likely_cause:
+          type: string
+          maxLength: 1000
+        recommended_actions:
+          type: array
+          minItems: 1
+          maxItems: 10
+          items:
+            type: object
+            required: [step, detail]
+            properties:
+              step:   { type: integer }
+              detail: { type: string, maxLength: 600 }
+              source_refs:
+                type: array
+                items: { type: string }
+                description: Citation IDs supporting this step.
+        citations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Citation'
+        related_rfs:
+          type: array
+          description: Similar past tickets, ranked by relevance.
+          items:
+            type: object
+            properties:
+              lodge_id: { type: string }
+              score:    { type: number }
+              snippet:  { type: string, maxLength: 240 }
+        verifier_flags:
+          type: array
+          description: Issues the Verifier raised but did not block on.
+          items:
+            type: object
+            properties:
+              kind: { type: string, enum: [unsupported_claim, weak_citation, low_confidence, retrieval_gap] }
+              detail: { type: string }
+
+    Citation:
+      type: object
+      required: [id, source, locator]
+      properties:
+        id:       { type: string, description: Stable id used in source_refs. }
+        source:   { type: string, enum: [manual, rfs_ticket, code_script] }
+        locator:
+          type: object
+          description: Source-specific pointer (chunk id, ticket id, file+section).
+          additionalProperties: true
+        snippet:  { type: string, maxLength: 400 }
+        score:    { type: number }
+
+    AgentStep:
+      type: object
+      required: [agent, model, status, duration_ms]
+      properties:
+        agent:
+          type: string
+          enum: [classifier, retrieval_planner, analyst, verifier, formatter]
+        model: { type: string }
+        status:
+          type: string
+          enum: [ok, short_circuit, retried, failed]
+        duration_ms: { type: integer }
+        input_tokens:           { type: integer }
+        input_cache_read_tokens: { type: integer }
+        output_tokens:          { type: integer }
+        note: { type: string, description: Free-form (e.g., "short-circuit: duplicate of LDG-12345"). }
+
+    Usage:
+      type: object
+      properties:
+        input_tokens:            { type: integer }
+        input_cache_read_tokens: { type: integer }
+        input_cache_write_tokens: { type: integer }
+        output_tokens:           { type: integer }
+        estimated_cost_rm:       { type: number }
+
+    Readiness:
+      type: object
+      required: [status, deps]
+      properties:
+        status: { type: string, enum: [ready, degraded, down] }
+        deps:
+          type: object
+          properties:
+            elasticsearch: { type: boolean }
+            ollama:        { type: boolean }
+            anthropic:     { type: boolean }
+            redis:         { type: boolean }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable code.
+              enum:
+                - bad_request
+                - unauthorized
+                - forbidden
+                - not_found
+                - conflict
+                - payload_too_large
+                - rate_limited
+                - idempotency_conflict
+                - budget_exhausted
+                - upstream_unavailable
+                - internal
+            message: { type: string }
+            request_id: { type: string }
+            details: { type: object, additionalProperties: true }
+
+    WebhookEnvelope:
+      type: object
+      description: |
+        Body of the webhook POST sent to `callback_url`. Signed via
+        `X-Rag-Signature: sha256=<hex(hmac_sha256(secret, body))>`. Replay
+        protection via `X-Rag-Timestamp` (unix seconds) — reject if > 5 min skew.
+      required: [job_id, status, delivered_at]
+      properties:
+        job_id:       { type: string, format: uuid }
+        status:       { type: string, enum: [succeeded, failed, cancelled, expired] }
+        delivered_at: { type: string, format: date-time }
+        result:       { $ref: '#/components/schemas/Analysis' }
+        error:        { $ref: '#/components/schemas/Error' }
+        usage:        { $ref: '#/components/schemas/Usage' }
