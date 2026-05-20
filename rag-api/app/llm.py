@@ -161,8 +161,13 @@ def call_agent_json(
     user_payload: dict[str, Any] | str,
     max_tokens: int,
     retry_on_parse_error: bool = True,
+    attachment_blocks: list[dict[str, Any]] | None = None,
 ) -> LLMResult:
     """Call an agent and require a JSON object response.
+
+    `attachment_blocks`, when given, are native Claude content blocks
+    (image / document / text) appended after the JSON payload in the user
+    turn — used to hand files to the Analyst and Verifier.
 
     Raises LLMOverloaded on 5xx-style transient failures, LLMError on
     permanent failures, LLMParseError if parsing still fails after one retry.
@@ -171,7 +176,12 @@ def call_agent_json(
     user_content = user_payload if isinstance(user_payload, str) else json.dumps(
         user_payload, separators=(",", ":")
     )
-    messages = [{"role": "user", "content": user_content}]
+    if attachment_blocks:
+        content: Any = [{"type": "text", "text": user_content},
+                        *attachment_blocks]
+    else:
+        content = user_content
+    messages = [{"role": "user", "content": content}]
 
     start = time.monotonic()
     try:

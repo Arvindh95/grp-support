@@ -6,6 +6,7 @@ Formatter. All external services mocked at the LLM and ES boundaries.
 """
 from __future__ import annotations
 
+import base64
 import json
 
 import pytest
@@ -679,6 +680,67 @@ async def test_llm_formatter_backfills_dropped_verifier_flags(
     kinds = {f.kind.value for f in final.result.verifier_flags}
     # The flag was backfilled even though the LLM Formatter dropped it.
     assert "weak_citation" in kinds
+
+
+@pytest.mark.asyncio
+async def test_attachment_reaches_analyst_as_chunk_and_block(
+    monkeypatch, client, good_headers,
+):
+    """An RFS attachment becomes a citable pseudo-chunk in retrieved_context
+    AND a native content block handed to the Analyst."""
+    seen = []
+
+    def dispatch(**kw):
+        sp = kw.get("system_prompt", "")
+        seen.append((sp, kw.get("user_payload"), kw.get("attachment_blocks")))
+        if sp.startswith("You are a support-ticket classifier"):
+            return _llm_result(CLASSIFIER_OUT)
+        if sp.startswith("You are a retrieval-planner"):
+            return _llm_result(PLANNER_OUT)
+        if sp.startswith("You are a GRP / Acumatica ERP support analyst"):
+            return _llm_result(ANALYST_OUT, input_tokens=8000, output_tokens=1500)
+        if sp.startswith("You are a verifier"):
+            return _llm_result(VERIFIER_PASS)
+        if sp.startswith("You are a formatter"):
+            raise llm.LLMParseError("force det. fallback in this test")
+        raise AssertionError(sp[:80])
+    monkeypatch.setattr(classifier_agent.llm, "call_agent_json", dispatch)
+
+    def fake_es(index, body):
+        if index == "grp-manuals":
+            return {"hits": {"hits": [
+                {"_index": "grp-manuals", "_id": "m1", "_score": 2.0,
+                 "_source": {"module": "A", "section": "L",
+                             "content": "POST /license/refresh"}}]}}
+        return {"hits": {"hits": [
+            {"_index": "rfs-tickets-mar-2025", "_id": "t1", "_score": 1.0,
+             "_source": {"lodge_id": "LDG-90211", "notes": "x"}}]}}
+    monkeypatch.setattr(retrieval, "_es_search", fake_es)
+    monkeypatch.setattr(retrieval.embed, "embed_text", lambda t: [0.1] * 4)
+
+    csv_b64 = base64.b64encode(b"col,val\n1,2\n").decode()
+    payload = {"rfs": {
+        "lodge_id": "LDG-ATT",
+        "notes": "See the attached CSV for the failing rows.",
+        "attachments": [{"filename": "rows.csv", "content_type": "text/csv",
+                         "content_b64": csv_b64}],
+    }}
+    job_id = client.post("/rfs/analyze", json=payload,
+                         headers=good_headers).json()["job_id"]
+    job = queue.dequeue(timeout_seconds=1)
+    await worker._process_one(job)
+    final = queue.get_job(job_id)
+    assert final.status == JobStatus.succeeded
+
+    analyst = [(p, ab) for sp, p, ab in seen
+               if sp.startswith("You are a GRP / Acumatica ERP support analyst")]
+    assert analyst, "Analyst was never called"
+    payload_seen, blocks_seen = analyst[0]
+    # Pseudo-chunk present in retrieved_context.
+    ids = [c["chunk_id"] for c in payload_seen["retrieved_context"]]
+    assert "attachment::rows.csv" in ids
+    # Native content block handed over too.
+    assert blocks_seen and any("rows.csv" in str(b) for b in blocks_seen)
 
 
 @pytest.mark.asyncio

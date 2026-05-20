@@ -54,6 +54,10 @@ You will receive:
   - retrieved_context: the same evidence chunks the Analyst saw
   - category: from the prior Classifier step
 
+If a chunk has source "attachment", its `text` is only a placeholder — the
+real file (PDF / image / text) is supplied to you as attached content blocks.
+Verify attachment-cited claims against those attached files directly.
+
 Run the 5-check rubric below. Output ONE JSON object only. No prose, no
 markdown fences.
 
@@ -235,6 +239,8 @@ def verify(
     analyst_output: AnalystOutput,
     chunks: Sequence[RetrievedChunk],
     category: str,
+    *,
+    attachment_blocks: list[dict[str, Any]] | None = None,
 ) -> tuple[VerifierOutput, AgentStep]:
     payload = {
         "category": category,
@@ -246,6 +252,7 @@ def verify(
         res = llm.call_agent_json(
             model=MODEL, system_prompt=SYSTEM_PROMPT,
             user_payload=payload, max_tokens=MAX_TOKENS,
+            attachment_blocks=attachment_blocks,
         )
     except llm.LLMParseError as e:
         log.warning('"verifier.unparseable err=%s"', e)
@@ -287,6 +294,9 @@ FINAL_REVIEW_PROMPT = """You are a verifier performing the FINAL review of a GRP
 You receive the FINAL Analysis object that will be returned to the user, plus
 the retrieved evidence chunks. Output verifier flags that reference the
 Analysis EXACTLY as given — its own step numbers and citation ids (cit-1, ...).
+
+If a chunk has source "attachment", the real file is supplied as an attached
+content block — judge attachment-backed citations against the actual file.
 
 Output ONE JSON object only. No prose, no markdown fences.
 
@@ -340,6 +350,8 @@ def verify_analysis(
     analysis: Analysis,
     chunks: Sequence[RetrievedChunk],
     category: str,
+    *,
+    attachment_blocks: list[dict[str, Any]] | None = None,
 ) -> tuple[list[VerifierFlag], AgentStep]:
     """Re-verify the FINAL Analysis (post-Formatter). Returns flags that
     reference the Analysis's own step numbers / cit-ids — unlike the
@@ -357,6 +369,7 @@ def verify_analysis(
         res = llm.call_agent_json(
             model=MODEL, system_prompt=FINAL_REVIEW_PROMPT,
             user_payload=payload, max_tokens=MAX_TOKENS,
+            attachment_blocks=attachment_blocks,
         )
     except llm.LLMParseError as e:
         log.warning('"verifier.final_review_unparseable err=%s"', e)

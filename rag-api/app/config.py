@@ -33,6 +33,7 @@ class Config:
 
     # Limits
     max_body_bytes: int
+    max_attachment_bytes: int   # total decoded size of all attachments per RFS
     idempotency_ttl_seconds: int
     job_ttl_seconds: int
 
@@ -62,7 +63,9 @@ def load_config() -> Config:
         anthropic_api_key=os.environ["ANTHROPIC_API_KEY"],
         webhook_default_secret=os.environ.get("WEBHOOK_DEFAULT_SECRET", ""),
         rate_limit_per_minute=int(os.environ.get("RATE_LIMIT_PER_MINUTE", "60")),
-        max_body_bytes=int(os.environ.get("MAX_BODY_BYTES", str(256 * 1024))),
+        max_body_bytes=int(os.environ.get("MAX_BODY_BYTES", str(40 * 1024 * 1024))),
+        max_attachment_bytes=int(os.environ.get(
+            "MAX_ATTACHMENT_BYTES", str(25 * 1024 * 1024))),
         idempotency_ttl_seconds=int(os.environ.get("IDEMPOTENCY_TTL", str(24 * 3600))),
         job_ttl_seconds=int(os.environ.get("JOB_TTL", str(7 * 24 * 3600))),
         worker_concurrency=int(os.environ.get("WORKER_CONCURRENCY", "2")),

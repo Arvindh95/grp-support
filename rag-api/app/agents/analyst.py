@@ -55,8 +55,15 @@ You will receive:
   - classifier_output: category + tags from a prior agent
   - retrieved_context: a list of evidence chunks pulled from manuals,
     past tickets, and code scripts. Each chunk has a `chunk_id`, a
-    `source` ("manual" | "rfs_ticket" | "code_script"), a `locator`,
-    a `text` body, and a `score`.
+    `source` ("manual" | "rfs_ticket" | "code_script" | "attachment"),
+    a `locator`, a `text` body, and a `score`.
+
+Attachments: if the caller attached files, they appear in retrieved_context
+as chunks with source "attachment" and chunk_id "attachment::<filename>".
+For those, the chunk `text` is only a placeholder — the ACTUAL file content
+(PDF pages, images, text) is supplied to you as separate attached content
+blocks after this JSON. Read those files directly. When a fact comes from an
+attached file, cite its "attachment::<filename>" chunk_id like any other.
 
 Produce ONE JSON object only. No prose, no markdown fences.
 
@@ -233,8 +240,12 @@ def analyze(
     *,
     model: str = MODEL_DEFAULT,
     extra_system_suffix: str | None = None,
+    attachment_blocks: list[dict[str, Any]] | None = None,
 ) -> tuple[AnalystOutput, AgentStep]:
-    """Run the Analyst. Returns (AnalystOutput, AgentStep)."""
+    """Run the Analyst. Returns (AnalystOutput, AgentStep).
+
+    `attachment_blocks` are native Claude content blocks for any files the
+    caller attached — handed to the model so it can read them directly."""
     retrieved_ids = {c.chunk_id for c in chunks}
     empty_retrieval = len(chunks) == 0
 
@@ -262,6 +273,7 @@ def analyze(
         res = llm.call_agent_json(
             model=model, system_prompt=system,
             user_payload=payload, max_tokens=MAX_TOKENS,
+            attachment_blocks=attachment_blocks,
         )
     except llm.LLMParseError as e:
         return _unsupported_fallback(rfs, classifier_output,
@@ -291,6 +303,7 @@ def analyze(
         res2 = llm.call_agent_json(
             model=model, system_prompt=system + "\n\n" + suffix,
             user_payload=payload, max_tokens=MAX_TOKENS,
+            attachment_blocks=attachment_blocks,
         )
     except llm.LLMParseError as e2:
         usage = res.usage
@@ -326,6 +339,8 @@ def retry_with_opus(
     classifier_output: ClassifierOutput,
     chunks: Sequence[RetrievedChunk],
     verifier_reason: str,
+    *,
+    attachment_blocks: list[dict[str, Any]] | None = None,
 ) -> tuple[AnalystOutput, AgentStep]:
     """Re-run the Analyst on claude-opus-4-7 after Verifier returned must_retry."""
     suffix = (
@@ -334,7 +349,8 @@ def retry_with_opus(
         + ". Produce a new analysis that addresses the issue."
     )
     return analyze(rfs, classifier_output, chunks,
-                   model=MODEL_RETRY, extra_system_suffix=suffix)
+                   model=MODEL_RETRY, extra_system_suffix=suffix,
+                   attachment_blocks=attachment_blocks)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

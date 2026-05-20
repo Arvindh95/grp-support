@@ -14,8 +14,9 @@ location /rag/ {
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-Host  $host;
 
-    # Modest body cap; service also enforces this at the app layer.
-    client_max_body_size 512k;
+    # Body cap — large enough for inline base64 attachments (25 MB of files
+    # base64-encodes to ~34 MB). The app re-checks via MAX_BODY_BYTES.
+    client_max_body_size 40m;
 
     # Long-running jobs are async — clients poll. So no SSE/streaming timeouts
     # to extend.

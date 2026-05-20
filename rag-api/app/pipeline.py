@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from . import attachments as attachments_mod
 from . import retrieval
 from .deps import get_config
 from .agents import analyst as analyst_agent
@@ -39,7 +40,7 @@ from .models import (
 log = logging.getLogger("rag-api.pipeline")
 
 
-PIPELINE_VERSION = "0.5.0-formatter"
+PIPELINE_VERSION = "0.6.0-attachments"
 
 
 async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], Usage]:
@@ -63,6 +64,25 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
         usage.estimated_cost_rm = _estimate_cost_rm(usage)
         return analysis, trace, usage
 
+    # ── Attachments — decode the caller's files once; the same content
+    #    blocks are reused by the Analyst, the Verifier, and the final
+    #    review. Each file also becomes a citable pseudo-chunk. ─────────────────
+    attach_blocks: list[dict] = []
+    attach_chunks: list[retrieval.RetrievedChunk] = []
+    if rfs.attachments:
+        try:
+            decoded = attachments_mod.decode_and_validate(
+                rfs.attachments,
+                max_total_bytes=get_config().max_attachment_bytes,
+            )
+            attach_blocks = attachments_mod.build_content_blocks(decoded)
+            attach_chunks = attachments_mod.build_pseudo_chunks(decoded)
+            log.info('"pipeline.attachments count=%d"', len(decoded))
+        except attachments_mod.AttachmentError as e:
+            # The submit route validates attachments up front; reaching here
+            # is unexpected — proceed without them rather than fail the job.
+            log.warning('"pipeline.attachments_invalid err=%s"', e)
+
     # ── 2. Retrieval Planner ──────────────────────────────────────────────────
     plan_out, plan_step = await asyncio.to_thread(planner_agent.plan, rfs, cls_out)
     trace.append(plan_step)
@@ -73,12 +93,18 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
     chunks, debug = await asyncio.to_thread(
         retrieval.execute_plan, plan_out.queries, embed_query=embed_query,
     )
-    log.info('"retrieval.done queries=%d raw=%d kept=%d"',
-             debug.queries_run, debug.raw_hits, debug.after_cap)
+    # Attachment pseudo-chunks join the retrieved set so the Analyst can cite
+    # files exactly like manual/ticket chunks.
+    if attach_chunks:
+        chunks = list(chunks) + attach_chunks
+    log.info('"retrieval.done queries=%d raw=%d kept=%d attachments=%d"',
+             debug.queries_run, debug.raw_hits, debug.after_cap,
+             len(attach_chunks))
 
     # ── 4. Analyst (REAL — Sonnet) ───────────────────────────────────────────
     analyst_out, analyst_step = await asyncio.to_thread(
         analyst_agent.analyze, rfs, cls_out, chunks,
+        attachment_blocks=attach_blocks,
     )
     trace.append(analyst_step)
     _add_usage(usage, analyst_step)
@@ -86,6 +112,7 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
     # ── 5. Verifier (REAL — Haiku rubric, may trigger Opus retry) ────────────
     verifier_out, verifier_step = await asyncio.to_thread(
         verifier_agent.verify, analyst_out, chunks, cls_out.category,
+        attachment_blocks=attach_blocks,
     )
     trace.append(verifier_step)
     _add_usage(usage, verifier_step)
@@ -98,12 +125,14 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
         opus_out, opus_step = await asyncio.to_thread(
             analyst_agent.retry_with_opus, rfs, cls_out, chunks,
             verifier_out.must_retry_reason or "verifier requested retry",
+            attachment_blocks=attach_blocks,
         )
         trace.append(opus_step)
         _add_usage(usage, opus_step)
 
         reverify_out, reverify_step = await asyncio.to_thread(
             verifier_agent.verify, opus_out, chunks, cls_out.category,
+            attachment_blocks=attach_blocks,
         )
         trace.append(reverify_step)
         _add_usage(usage, reverify_step)
@@ -143,6 +172,7 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
     #     leaving the original flags pointing at steps that no longer exist.
     final_flags, reverify_step = await asyncio.to_thread(
         verifier_agent.verify_analysis, analysis, chunks, cls_out.category,
+        attachment_blocks=attach_blocks,
     )
     trace.append(reverify_step)
     _add_usage(usage, reverify_step)

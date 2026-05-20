@@ -43,6 +43,7 @@ class CitationSource(str, Enum):
     manual = "manual"
     rfs_ticket = "rfs_ticket"
     code_script = "code_script"
+    attachment = "attachment"
 
 
 class AgentName(str, Enum):
@@ -87,9 +88,12 @@ class Attachment(BaseModel):
     model_config = ConfigDict(extra="forbid")
     filename: str
     content_type: str
-    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
-    bytes: int = Field(ge=0)
+    # sha256/bytes are optional metadata (relevant for the url-fetch case).
+    sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    bytes: int | None = Field(default=None, ge=0)
     url: HttpUrl | None = None
+    # Inline file content, base64-encoded. The supported delivery mode in v1.
+    content_b64: str | None = None
 
 
 class Action(BaseModel):

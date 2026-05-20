@@ -72,7 +72,7 @@ Schema (must match exactly):
   "citations": [
     {
       "id": "cit-1",
-      "source": "manual" | "rfs_ticket" | "code_script",
+      "source": "manual" | "rfs_ticket" | "code_script" | "attachment",
       "locator": <copy locator from the matching retrieved_context chunk>,
       "snippet": "<<=400 chars, one sentence from the chunk text>",
       "score": <float>

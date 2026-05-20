@@ -46,6 +46,8 @@ def _kind_to_source(kind: str) -> CitationSource:
         return CitationSource.manual
     if kind == "rfs_ticket":
         return CitationSource.rfs_ticket
+    if kind == "attachment":
+        return CitationSource.attachment
     return CitationSource.code_script
 
 

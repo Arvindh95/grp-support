@@ -42,6 +42,19 @@ def submit_rfs(
             ),
         )
 
+    # Validate attachments up front — the caller gets a fast, explicit 400
+    # (e.g. "convert Word to PDF") instead of a deep worker failure.
+    if payload.rfs.attachments:
+        from ..attachments import AttachmentError, decode_and_validate
+        try:
+            decode_and_validate(payload.rfs.attachments,
+                                max_total_bytes=cfg.max_attachment_bytes)
+        except AttachmentError as e:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=error_envelope(ErrorCode.bad_request, str(e)),
+            )
+
     body_dict = payload.model_dump(mode="json")
 
     # Idempotency
