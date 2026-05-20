@@ -36,7 +36,9 @@ from .verifier import VerifierOutput
 log = logging.getLogger("rag-api.agent.formatter")
 
 MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 1500
+# 12 retrieved chunks → up to ~10 citations + 10 actions of JSON. 1500 was
+# too tight and truncated the response mid-object → unparseable.
+MAX_TOKENS = 4000
 
 
 class FormatterError(RuntimeError):
