@@ -78,9 +78,10 @@ def test_rejects_bad_base64():
         decode_and_validate(atts, max_total_bytes=1_000_000)
 
 
-def test_rejects_empty_decoded():
+def test_rejects_empty_content():
+    # Empty bytes base64-encode to "" — caught as a missing content_b64.
     atts = [_att("a.pdf", "application/pdf", b"")]
-    with pytest.raises(AttachmentError, match="empty"):
+    with pytest.raises(AttachmentError, match="content_b64 is required"):
         decode_and_validate(atts, max_total_bytes=1_000_000)
 
 
