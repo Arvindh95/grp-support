@@ -5,7 +5,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import {
   Users, Upload, BarChart3, ArrowLeft, LogOut, Database,
-  KeyRound, Activity, BookOpen, BookText, FlaskConical,
+  KeyRound, Activity, BookOpen, BookText, FlaskConical, Sparkles,
   PanelLeftClose, PanelLeftOpen,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -26,6 +26,7 @@ const NAV = [
     group: "RAG-API",
     items: [
       { href: "/admin/api-keys/", label: "API Keys", icon: KeyRound },
+      { href: "/admin/claude-key/", label: "Claude API Key", icon: Sparkles },
       { href: "/admin/api-health/", label: "API Health", icon: Activity },
       { href: "/admin/api-guide/", label: "API Guide", icon: BookText },
       { href: "/admin/api-docs/", label: "API Reference", icon: BookOpen },

@@ -57,6 +57,8 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://173.212.247.3:8081").rstri
 # Index for service / integration API keys
 API_KEYS_INDEX = "grp-api-keys"
 RESET_TOKENS_INDEX = "grp-reset-tokens"
+# Index for admin-set runtime settings (e.g. the Claude API key)
+SETTINGS_INDEX = "grp-settings"
 
 CHAT_UPLOAD_DIR = os.environ.get("CHAT_UPLOAD_DIR", "/tmp/grp-chat")
 os.makedirs(CHAT_UPLOAD_DIR, exist_ok=True)
@@ -983,6 +985,70 @@ def api_key_revoke(key_id: str) -> dict:
     return {"ok": True, "id": key_id}
 
 
+# ── Claude API key (admin-set, live; used by the chatbot and the RAG-API) ─────
+class AnthropicKeyReq(BaseModel):
+    key: str
+
+
+def _mask_anthropic_key(k: str) -> str:
+    return f"{k[:10]}…{k[-4:]}" if k and len(k) > 16 else "set"
+
+
+@app.get("/settings/anthropic-key", dependencies=[Depends(require_admin)])
+def anthropic_key_status() -> dict:
+    """Report whether a Claude key is configured. Never returns the key."""
+    meta: dict = {}
+    try:
+        r = requests.get(f"{ES_URL}/{SETTINGS_INDEX}/_doc/anthropic",
+                         auth=ES_AUTH, verify=False, timeout=5)
+        if r.status_code == 200:
+            meta = r.json().get("_source", {}) or {}
+    except Exception:
+        pass
+    has_stored = bool(meta.get("key"))
+    return {
+        "configured": has_stored,
+        "source": "ui" if has_stored else "environment",
+        "hint": _mask_anthropic_key(meta["key"]) if has_stored else None,
+        "updated_at": meta.get("updated_at"),
+        "updated_by": meta.get("updated_by"),
+    }
+
+
+@app.put("/settings/anthropic-key")
+def anthropic_key_set(req: AnthropicKeyReq,
+                      user: dict = Depends(require_admin)) -> dict:
+    """Store a Claude API key. Validated against Anthropic before saving, so a
+    broken key can never be persisted. Takes effect within ~60s, no restart."""
+    key = (req.key or "").strip()
+    if not key.startswith("sk-ant-"):
+        raise HTTPException(400, "A Claude API key starts with 'sk-ant-'.")
+
+    # Validate with a real (minimal) call before persisting.
+    try:
+        anthropic.Anthropic(api_key=key).messages.create(
+            model="claude-haiku-4-5", max_tokens=1,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+    except anthropic.APIStatusError as e:
+        if getattr(e, "status_code", None) in (401, 403):
+            raise HTTPException(400, "Anthropic rejected this key (unauthorized).")
+        raise HTTPException(400, f"Could not validate the key — try again ({e}).")
+    except Exception as e:
+        raise HTTPException(400, f"Could not validate the key — try again ({e}).")
+
+    doc = {"key": key, "updated_at": int(_time.time() * 1000),
+           "updated_by": user.get("email", "?")}
+    r = requests.post(
+        f"{ES_URL}/{SETTINGS_INDEX}/_doc/anthropic?refresh=true",
+        auth=ES_AUTH, verify=False, json=doc, timeout=10,
+    )
+    if r.status_code not in (200, 201):
+        raise HTTPException(500, f"Save failed: {r.text[:200]}")
+    _anthropic_key_cache["at"] = 0.0   # bust cache so this worker reloads now
+    return {"ok": True, "hint": _mask_anthropic_key(key)}
+
+
 class ChangePasswordReq(BaseModel):
     old_password: str
     new_password: str
@@ -1869,7 +1935,47 @@ def format_history(history: list) -> str:
 
 import anthropic
 
-_anthropic = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# ── Claude API key — env default, overridable live via the admin UI ──────────
+# The effective key is whatever is stored in grp-settings (set in the UI),
+# falling back to ANTHROPIC_API_KEY from the environment. The stored value is
+# cached ~60s so a UI change takes effect without a restart; the Anthropic
+# client is rebuilt whenever the effective key changes.
+_ANTHROPIC_KEY_CACHE_TTL = 60
+_anthropic_key_cache = {"key": None, "at": 0.0}
+_anthropic_client = None
+_anthropic_client_key = None
+
+
+def _stored_anthropic_key() -> str | None:
+    """The admin-set Claude key from grp-settings, or None. Cached ~60s."""
+    now = _time.time()
+    if now - _anthropic_key_cache["at"] < _ANTHROPIC_KEY_CACHE_TTL:
+        return _anthropic_key_cache["key"]
+    try:
+        r = requests.get(f"{ES_URL}/{SETTINGS_INDEX}/_doc/anthropic",
+                         auth=ES_AUTH, verify=False, timeout=5)
+        key = None
+        if r.status_code == 200:
+            key = (r.json().get("_source") or {}).get("key") or None
+        _anthropic_key_cache["key"] = key
+        _anthropic_key_cache["at"] = now
+        return key
+    except Exception:
+        return _anthropic_key_cache["key"]   # last known on an ES blip
+
+
+def _effective_anthropic_key() -> str:
+    return _stored_anthropic_key() or ANTHROPIC_API_KEY
+
+
+def get_anthropic() -> "anthropic.Anthropic":
+    """Anthropic client built with the effective key; rebuilt when it changes."""
+    global _anthropic_client, _anthropic_client_key
+    key = _effective_anthropic_key()
+    if _anthropic_client is None or _anthropic_client_key != key:
+        _anthropic_client = anthropic.Anthropic(api_key=key)
+        _anthropic_client_key = key
+    return _anthropic_client
 
 ES_TOOLS = [
     {
@@ -2042,7 +2148,7 @@ def call_claude_agent(question: str, seed_context: str,
 
     try:
         for _step in range(_MAX_TOOL_ITERS):
-            resp = _anthropic.messages.create(
+            resp = get_anthropic().messages.create(
                 model=ANTHROPIC_MODEL,
                 max_tokens=8000,
                 system=[{
@@ -2284,7 +2390,7 @@ def _stream_claude_agent(user_email: str, req: QueryRequest):
 
     try:
         for _step in range(_MAX_TOOL_ITERS):
-            with _anthropic.messages.stream(
+            with get_anthropic().messages.stream(
                 model=ANTHROPIC_MODEL,
                 max_tokens=8000,
                 system=[{
