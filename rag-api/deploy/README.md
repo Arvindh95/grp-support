@@ -27,8 +27,11 @@ sudo install -o root -g root -m 0644 \
 sudo systemctl daemon-reload
 sudo systemctl enable --now rag-api
 
-# 5. nginx — splice the snippet into the TLS server block
-sudo cp /etc/nginx/sites-enabled/grp-chat-tls /etc/nginx/sites-enabled/grp-chat-tls.bak
+# 5. nginx — splice the snippet into the TLS server block.
+#    Back up OUTSIDE sites-enabled — nginx loads every file in that dir, so a
+#    *.bak there duplicates `limit_req_zone` and breaks `nginx -t`.
+sudo mkdir -p /root/nginx-backups
+sudo cp /etc/nginx/sites-enabled/grp-chat-tls /root/nginx-backups/grp-chat-tls.bak
 # manually insert the contents of deploy/nginx-rag.snippet inside `server { ... }`
 sudo nginx -t && sudo systemctl reload nginx
 
