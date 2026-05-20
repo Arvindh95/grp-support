@@ -5,6 +5,8 @@ The worker reads this when running the pipeline + delivering the webhook.
 
 Stored fields:
   callback_url, callback_secret_hint  — webhook config
+  owner_key_id                         — id of the API key that submitted the
+                                         job; GET /jobs enforces ownership
   rfs                                  — the original RFS payload, fed to
                                          the pipeline by the worker
 """
@@ -22,11 +24,13 @@ def _key(job_id: str) -> str:
 
 def save_submit_meta(job_id: str, *, callback_url: str | None,
                      callback_secret_hint: str | None,
+                     owner_key_id: str | None = None,
                      rfs: dict[str, Any] | None = None) -> None:
     cfg = get_config()
     data: dict[str, Any] = {
         "callback_url": callback_url,
         "callback_secret_hint": callback_secret_hint,
+        "owner_key_id": owner_key_id,
     }
     if rfs is not None:
         data["rfs"] = rfs

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 
 API_KEYS_INDEX = "grp-api-keys"
+USERS_INDEX = "grp-users"
 _CACHE_TTL_SECONDS = 30
 
 
@@ -31,38 +32,55 @@ def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
 
 
-def _lookup_es(cfg: "Config", key_hash: str) -> dict | None:
+def _es_search(cfg: "Config", index: str, query: dict) -> list | None:
+    """Return ES hits, or None on any transport/HTTP error (fail-closed)."""
     try:
         r = requests.post(
-            f"{cfg.es_url}/{API_KEYS_INDEX}/_search",
+            f"{cfg.es_url}/{index}/_search",
             auth=(cfg.es_user, cfg.es_password),
             verify=cfg.es_verify_tls,
-            json={
-                "query": {
-                    "bool": {
-                        "filter": [
-                            {"term": {"key_hash": key_hash}},
-                            {"term": {"revoked": False}},
-                        ]
-                    }
-                },
-                "size": 1,
-            },
+            json={"query": query, "size": 1},
             timeout=5,
         )
     except requests.RequestException:
         return None
     if r.status_code != 200:
         return None
-    hits = r.json().get("hits", {}).get("hits", [])
-    if not hits:
+    return r.json().get("hits", {}).get("hits", [])
+
+
+def _resolve_principal(cfg: "Config", key_hash: str) -> dict | None:
+    """Validate the API key AND re-check its owner.
+
+    A key is only valid while its owner still exists as a user in grp-users.
+    The owner's role is read LIVE from grp-users — never the (possibly stale)
+    role snapshot stored on the key document — so a deleted or demoted user
+    cannot keep an elevated key.
+    """
+    key_hits = _es_search(cfg, API_KEYS_INDEX, {
+        "bool": {"filter": [
+            {"term": {"key_hash": key_hash}},
+            {"term": {"revoked": False}},
+        ]}
+    })
+    if not key_hits:
         return None
-    src = hits[0]["_source"]
+    key_src = key_hits[0]["_source"]
+    owner_email = key_src.get("owner", "")
+    if not owner_email:
+        return None
+
+    user_hits = _es_search(cfg, USERS_INDEX, {"term": {"email": owner_email}})
+    if not user_hits:
+        # Owner deleted (or ES unreachable) — the key is dead.
+        return None
+    user_src = user_hits[0]["_source"]
+
     return {
-        "email": src.get("owner", ""),
-        "role": src.get("role", "user"),
-        "key_id": hits[0]["_id"],
-        "key_name": src.get("name", ""),
+        "email": owner_email,
+        "role": user_src.get("role", "user"),   # live role, not the key snapshot
+        "key_id": key_hits[0]["_id"],
+        "key_name": key_src.get("name", ""),
     }
 
 
@@ -74,7 +92,7 @@ def _principal_for_key(cfg: "Config", raw_key: str) -> dict | None:
         if cached and cached[0] > now:
             return cached[1]
 
-    principal = _lookup_es(cfg, h)
+    principal = _resolve_principal(cfg, h)
     with _cache_lock:
         _cache[h] = (now + _CACHE_TTL_SECONDS, principal)
     return principal

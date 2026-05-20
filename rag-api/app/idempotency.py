@@ -1,11 +1,15 @@
-"""Idempotency-Key handling.
+"""Idempotency-Key handling — atomic.
 
-Caller sends `Idempotency-Key: <uuid>`. We hash (key, body) and store
-{job_id, body_hash} for `idempotency_ttl_seconds`.
+Caller sends `Idempotency-Key: <token>`. We hash (key, body) and store
+`{job_id, body_hash}` for `idempotency_ttl_seconds`.
 
-- Same key, same body → return original job_id (replay).
+- Same key, same body → return the original job_id (replay).
 - Same key, different body → 409 idempotency_conflict.
 - No key → no protection; the caller owns retry-safety.
+
+The claim is made with an atomic Redis `SET NX`, carrying a job_id that the
+caller pre-generated. Two concurrent requests with the same key therefore
+cannot both win the claim — exactly one creates a job, the other replays it.
 """
 from __future__ import annotations
 
@@ -26,29 +30,50 @@ def _body_hash(body: dict) -> str:
 
 
 @dataclass
-class IdempotencyHit:
-    job_id: str
-    body_hash: str
+class Decision:
+    """Outcome of an idempotency claim.
 
-
-def check(token: str, body: dict) -> tuple[IdempotencyHit | None, bool]:
-    """Look up token. Returns (existing_record_or_None, conflict_bool).
-
-    - (None, False)        — first sight, caller should proceed.
-    - (record, False)      — replay; caller should return the original job.
-    - (record, True)       — token reuse with different body; caller should 409.
+    action == "proceed"  — claim won; caller must create the job with `new_job_id`.
+    action == "replay"   — same key + body already used; return `job_id`.
+    action == "conflict" — same key, different body; return 409 (`job_id` is the
+                           original job, for the error payload).
     """
-    raw = get_redis().get(_idem_key(token))
+    action: str
+    job_id: str | None = None
+
+
+def begin(token: str, body: dict, new_job_id: str) -> Decision:
+    """Atomically claim `token`.
+
+    On `proceed` the record already holds `new_job_id`; the caller must then
+    create the job with that id, and call `release()` if creation fails.
+    """
+    h = _body_hash(body)
+    key = _idem_key(token)
+    r = get_redis()
+    ttl = get_config().idempotency_ttl_seconds
+    record = json.dumps({"body_hash": h, "job_id": new_job_id})
+
+    # Atomic: only one concurrent caller can create the key.
+    if r.set(key, record, nx=True, ex=ttl):
+        return Decision("proceed")
+
+    raw = r.get(key)
     if raw is None:
-        return None, False
+        # The holder's record expired in the race window — try once more.
+        if r.set(key, record, nx=True, ex=ttl):
+            return Decision("proceed")
+        raw = r.get(key)
+        if raw is None:
+            return Decision("proceed")
+
     rec = json.loads(raw)
-    hit = IdempotencyHit(job_id=rec["job_id"], body_hash=rec["body_hash"])
-    if hit.body_hash != _body_hash(body):
-        return hit, True
-    return hit, False
+    if rec.get("body_hash") != h:
+        return Decision("conflict", rec.get("job_id"))
+    return Decision("replay", rec.get("job_id"))
 
 
-def remember(token: str, body: dict, job_id: str) -> None:
-    cfg = get_config()
-    payload = json.dumps({"job_id": job_id, "body_hash": _body_hash(body)})
-    get_redis().set(_idem_key(token), payload, ex=cfg.idempotency_ttl_seconds)
+def release(token: str) -> None:
+    """Drop a claim. Call only when job creation failed after begin()=proceed,
+    so a subsequent retry can claim the key cleanly."""
+    get_redis().delete(_idem_key(token))

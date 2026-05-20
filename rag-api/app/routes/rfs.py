@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import uuid
 
 from fastapi import APIRouter, Depends, Header, Request, Response, status
 from fastapi.responses import JSONResponse
@@ -96,7 +97,7 @@ async def submit_rfs(
     request: Request,
     response: Response,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    _principal: dict = Depends(require_api_key),
+    principal: dict = Depends(require_api_key),
     _rl: None = Depends(rate_limit),
 ):
     cfg = get_config()
@@ -133,47 +134,68 @@ async def submit_rfs(
                 content=error_envelope(ErrorCode.bad_request, str(e)),
             )
 
+    # Reject SSRF-prone webhook targets before the job is ever queued.
+    if payload.callback_url:
+        from ..webhook import CallbackUrlError, validate_callback_url
+        try:
+            validate_callback_url(str(payload.callback_url))
+        except CallbackUrlError as e:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=error_envelope(ErrorCode.bad_request,
+                                       f"callback_url rejected: {e}"),
+            )
+
     body_dict = payload.model_dump(mode="json")
 
-    # Idempotency
+    # Pre-generate the job id so the idempotency claim is atomic: the id is
+    # fixed in the claim record before the job exists, so two concurrent
+    # requests with the same key can never both enqueue a job.
+    new_job_id = uuid.uuid4()
+
     if idempotency_key:
-        existing, conflict = idempotency.check(idempotency_key, body_dict)
-        if conflict:
+        decision = idempotency.begin(idempotency_key, body_dict, str(new_job_id))
+        if decision.action == "conflict":
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
                 content=error_envelope(
                     ErrorCode.idempotency_conflict,
                     "Idempotency-Key reused with different payload",
-                    original_job_id=existing.job_id,
+                    original_job_id=decision.job_id,
                 ),
             )
-        if existing:
-            response.headers["Location"] = f"/jobs/{existing.job_id}"
-            accepted = JobAccepted(
-                job_id=existing.job_id,
+        if decision.action == "replay":
+            response.headers["Location"] = f"/jobs/{decision.job_id}"
+            return JobAccepted(
+                job_id=decision.job_id,
                 status=JobStatus.queued,
-                poll_url=f"/jobs/{existing.job_id}",
-            )
-            return accepted.model_dump(mode="json")
-
-    job = queue.create_job(
-        rfs_lodge_id=payload.rfs.lodge_id,
-        priority=payload.priority,
-        client_metadata=payload.client_metadata,
-    )
-
-    if idempotency_key:
-        idempotency.remember(idempotency_key, body_dict, str(job.job_id))
+                poll_url=f"/jobs/{decision.job_id}",
+            ).model_dump(mode="json")
+        # action == "proceed" — this request owns the claim.
 
     # Persist the RFS + callback config in a private sibling key. None of this
     # leaks via GET /jobs/{id}; only the worker reads it.
     from .._submit_meta import save_submit_meta
-    save_submit_meta(
-        str(job.job_id),
-        callback_url=str(payload.callback_url) if payload.callback_url else None,
-        callback_secret_hint=payload.callback_secret_hint,
-        rfs=body_dict["rfs"],
-    )
+    try:
+        job = queue.create_job(
+            job_id=new_job_id,
+            rfs_lodge_id=payload.rfs.lodge_id,
+            priority=payload.priority,
+            client_metadata=payload.client_metadata,
+        )
+        save_submit_meta(
+            str(job.job_id),
+            callback_url=str(payload.callback_url) if payload.callback_url else None,
+            callback_secret_hint=payload.callback_secret_hint,
+            owner_key_id=principal.get("key_id"),
+            rfs=body_dict["rfs"],
+        )
+    except Exception:
+        # Creation failed after we claimed the key — release it so a retry
+        # with the same Idempotency-Key is not permanently wedged.
+        if idempotency_key:
+            idempotency.release(idempotency_key)
+        raise
 
     accepted = JobAccepted(
         job_id=job.job_id,

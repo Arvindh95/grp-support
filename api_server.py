@@ -60,7 +60,10 @@ RESET_TOKENS_INDEX = "grp-reset-tokens"
 
 CHAT_UPLOAD_DIR = os.environ.get("CHAT_UPLOAD_DIR", "/tmp/grp-chat")
 os.makedirs(CHAT_UPLOAD_DIR, exist_ok=True)
-CHAT_UPLOAD_EXTS = {".pdf", ".md", ".txt", ".docx", ".png", ".jpg", ".jpeg", ".webp", ".csv"}
+# Only text-extractable types: the chat reads attachments as UTF-8 text
+# (.docx is converted to Markdown on upload). PDFs/images are NOT accepted —
+# decoding their bytes as text yields garbage the model cannot use.
+CHAT_UPLOAD_EXTS = {".md", ".txt", ".docx", ".csv"}
 CHAT_UPLOAD_MAX_BYTES = 25 * 1024 * 1024
 DOCUMENT_UPLOAD_MAX_BYTES = int(os.environ.get("DOCUMENT_UPLOAD_MAX_BYTES",
                                                 str(30 * 1024 * 1024)))
@@ -668,6 +671,38 @@ def _record_login_success(email: str) -> None:
         pass
 
 
+# Password-reset throttle — caps reset emails per address and per client IP
+# so the endpoint cannot be used to flood an inbox or to mint tokens en masse.
+RESET_REQ_MAX_PER_EMAIL = int(os.environ.get("RESET_REQ_MAX_PER_EMAIL", "3"))
+RESET_REQ_MAX_PER_IP    = int(os.environ.get("RESET_REQ_MAX_PER_IP", "15"))
+RESET_REQ_WINDOW        = int(os.environ.get("RESET_REQ_WINDOW", "3600"))
+
+
+def _reset_request_throttled(email: str, client_ip: str) -> bool:
+    """True if password-reset requests for this email, or from this IP, exceed
+    the hourly cap. Fails open (returns False) if Redis is unavailable."""
+    if _redis is None:
+        return False
+    try:
+        throttled = False
+        for scope, ident, cap in (
+            ("email", (email or "").strip().lower(), RESET_REQ_MAX_PER_EMAIL),
+            ("ip", client_ip or "", RESET_REQ_MAX_PER_IP),
+        ):
+            if not ident:
+                continue
+            key = f"grp:reset:req:{scope}:{ident}"
+            pipe = _redis.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, RESET_REQ_WINDOW)
+            count, _ = pipe.execute()
+            if int(count) > cap:
+                throttled = True
+        return throttled
+    except Exception:
+        return False
+
+
 
 class LoginReq(BaseModel):
     email:    str
@@ -815,9 +850,20 @@ class ResetConfirmReq(BaseModel):
 
 
 @app.post("/auth/reset-request")
-def auth_reset_request(req: ResetRequestReq) -> dict:
+def auth_reset_request(req: ResetRequestReq, request: Request) -> dict:
     """Issue a password-reset token for the given email if it exists. Always returns ok
     to avoid email enumeration."""
+    client_ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+                 or (request.client.host if request.client else ""))
+    # Throttle silently — the response stays uniform so enumeration is still
+    # impossible, but no token is minted and no email is sent when over cap.
+    if _reset_request_throttled(req.email, client_ip):
+        try:
+            log_kv("warning", "reset-request-throttled",
+                   email=req.email, ip=client_ip)
+        except Exception:
+            pass
+        return {"ok": True}
     user = get_user_by_email(req.email)
     if user:
         raw = _secrets.token_urlsafe(32)
@@ -2346,9 +2392,16 @@ async def upload_chat_file(file: UploadFile = File(...),
                             user: dict = Depends(current_user)) -> dict:
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in CHAT_UPLOAD_EXTS:
-        raise HTTPException(status_code=400, detail=f"Unsupported type: {ext}")
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Unsupported type: {ext or 'unknown'}. "
+                    f"Chat attachments must be text-readable: "
+                    f"{', '.join(sorted(CHAT_UPLOAD_EXTS))}."),
+        )
 
-    data = await file.read()
+    # Cap memory: read at most MAX+1 bytes so an oversized upload fails fast
+    # instead of buffering the whole body first.
+    data = await file.read(CHAT_UPLOAD_MAX_BYTES + 1)
     if len(data) > CHAT_UPLOAD_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large (max 25 MB)")
 
@@ -2666,7 +2719,13 @@ def _docx_to_md(content_bytes: bytes, filename: str) -> str:
     Returns MD text with image refs as ![](Images/<stem>/file.png).
     """
     import tempfile, shutil
-    stem = re.sub(r'\.docx$', '', filename, flags=re.IGNORECASE)
+    # Derive a filesystem- and URL-safe stem. The uploaded filename is
+    # attacker-controlled, so basename() it (drops any ../ or absolute path)
+    # and strip to a safe character set before it is used to build
+    # IMG_DIR/<stem> — otherwise extracted media could escape IMG_DIR.
+    stem = re.sub(r'\.docx$', '', os.path.basename(filename or ""),
+                  flags=re.IGNORECASE)
+    stem = re.sub(r'[^A-Za-z0-9._-]', '_', stem).strip('._') or "doc"
     with tempfile.TemporaryDirectory() as tmp:
         docx_path = os.path.join(tmp, "in.docx")
         with open(docx_path, "wb") as f:
