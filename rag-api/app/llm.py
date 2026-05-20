@@ -62,7 +62,6 @@ def call_messages(
     system: list[dict[str, Any]],
     messages: list[dict[str, Any]],
     max_tokens: int,
-    temperature: float = 0.0,
 ) -> Any:
     """Thin wrapper around `client.messages.create`. Returns the SDK Message."""
     client = get_anthropic()
@@ -71,7 +70,6 @@ def call_messages(
         system=system,
         messages=messages,
         max_tokens=max_tokens,
-        temperature=temperature,
     )
 
 
@@ -162,7 +160,6 @@ def call_agent_json(
     system_prompt: str,
     user_payload: dict[str, Any] | str,
     max_tokens: int,
-    temperature: float = 0.0,
     retry_on_parse_error: bool = True,
 ) -> LLMResult:
     """Call an agent and require a JSON object response.
@@ -179,7 +176,7 @@ def call_agent_json(
     start = time.monotonic()
     try:
         msg = call_messages(model=model, system=system_blocks, messages=messages,
-                            max_tokens=max_tokens, temperature=temperature)
+                            max_tokens=max_tokens)
     except Exception as e:
         # Map a few well-known SDK errors. Anything we can't classify is a
         # hard failure — orchestrator decides whether to retry.
@@ -209,8 +206,7 @@ def call_agent_json(
         ]
         try:
             msg2 = call_messages(model=model, system=system_blocks,
-                                 messages=messages2, max_tokens=max_tokens,
-                                 temperature=temperature)
+                                 messages=messages2, max_tokens=max_tokens)
         except Exception as e:
             raise LLMOverloaded(str(e)) from e
         text2 = _extract_text(msg2)
