@@ -30,6 +30,7 @@ from .models import (
     AgentStep,
     AgentStepStatus,
     Analysis,
+    CitationSource,
     Job,
     RFS,
     Usage,
@@ -110,9 +111,11 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
     _add_usage(usage, analyst_step)
 
     # ── 5. Verifier (REAL — Haiku rubric, may trigger Opus retry) ────────────
+    # The Verifier only needs the raw files if the Analyst actually cited an
+    # attachment — otherwise sending them just doubles the file-token cost.
     verifier_out, verifier_step = await asyncio.to_thread(
         verifier_agent.verify, analyst_out, chunks, cls_out.category,
-        attachment_blocks=attach_blocks,
+        attachment_blocks=attach_blocks if _cites_attachment(analyst_out) else None,
     )
     trace.append(verifier_step)
     _add_usage(usage, verifier_step)
@@ -132,7 +135,8 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
 
         reverify_out, reverify_step = await asyncio.to_thread(
             verifier_agent.verify, opus_out, chunks, cls_out.category,
-            attachment_blocks=attach_blocks,
+            attachment_blocks=(attach_blocks
+                               if _cites_attachment(opus_out) else None),
         )
         trace.append(reverify_step)
         _add_usage(usage, reverify_step)
@@ -172,7 +176,8 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
     #     leaving the original flags pointing at steps that no longer exist.
     final_flags, reverify_step = await asyncio.to_thread(
         verifier_agent.verify_analysis, analysis, chunks, cls_out.category,
-        attachment_blocks=attach_blocks,
+        attachment_blocks=(attach_blocks
+                           if _analysis_cites_attachment(analysis) else None),
     )
     trace.append(reverify_step)
     _add_usage(usage, reverify_step)
@@ -206,6 +211,23 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _cites_attachment(analyst_out) -> bool:
+    """True if the Analyst draft cites at least one attachment pseudo-chunk.
+    Used to decide whether the Verifier needs the raw files."""
+    for a in analyst_out.recommended_actions:
+        if any(str(c).startswith("attachment::") for c in a.citations):
+            return True
+    for c in analyst_out.claims:
+        if any(str(ref).startswith("attachment::") for ref in c.citations):
+            return True
+    return False
+
+
+def _analysis_cites_attachment(analysis: Analysis) -> bool:
+    """True if the final Analysis has any attachment-sourced citation."""
+    return any(c.source == CitationSource.attachment for c in analysis.citations)
+
 
 def _merge_flags(primary: list[VerifierFlag],
                  extra: list[VerifierFlag]) -> list[VerifierFlag]:

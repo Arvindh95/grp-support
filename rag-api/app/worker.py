@@ -76,6 +76,11 @@ async def _process_one(job: Job) -> None:
         if job:
             await webhook.deliver(job)
 
+    finally:
+        # Heavy base64 attachment bodies are dead weight in Redis once the
+        # job is processed — strip them, keep the lightweight submit-meta.
+        _submit_meta.purge_attachment_content(str(job.job_id))
+
 
 async def _worker_loop(worker_id: int) -> None:
     log.info('"worker.up id=%d"', worker_id)

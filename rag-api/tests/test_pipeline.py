@@ -742,6 +742,89 @@ async def test_attachment_reaches_analyst_as_chunk_and_block(
     # Native content block handed over too.
     assert blocks_seen and any("rows.csv" in str(b) for b in blocks_seen)
 
+    # Cost gate: the canned Analyst cites no attachment, so the Verifier must
+    # NOT receive the (expensive) file blocks.
+    verifier_blocks = [ab for sp, p, ab in seen
+                       if sp.startswith("You are a verifier")]
+    assert verifier_blocks, "Verifier was never called"
+    assert all(ab is None for ab in verifier_blocks)
+
+    # Redis hygiene: base64 attachment bytes are purged from submit-meta once
+    # the job is processed.
+    meta = _submit_meta.load_submit_meta(job_id)
+    assert meta["rfs"]["attachments"][0]["content_b64"] is None
+
+
+@pytest.mark.asyncio
+async def test_verifier_gets_files_when_analyst_cites_attachment(
+    monkeypatch, client, good_headers,
+):
+    """When the Analyst DOES cite an attachment, the Verifier receives the
+    file blocks so it can verify the attachment-sourced claim."""
+    analyst_cites_attachment = {
+        "summary": "Per the attached note, the batch lock was not released.",
+        "likely_cause": "Depreciation batch lock not released.",
+        "recommended_actions": [
+            {"step": 1, "detail": "Run grp-fa-unlock --batch.",
+             "citations": ["attachment::note.txt"]},
+        ],
+        "claims": [
+            {"id": "claim-1", "text": "The attached note documents the fix.",
+             "supports_step": [1], "citations": ["attachment::note.txt"]},
+        ],
+        "confidence": 0.7, "open_questions": [],
+    }
+    seen = []
+
+    def dispatch(**kw):
+        sp = kw.get("system_prompt", "")
+        seen.append((sp, kw.get("attachment_blocks")))
+        if sp.startswith("You are a support-ticket classifier"):
+            return _llm_result(CLASSIFIER_OUT)
+        if sp.startswith("You are a retrieval-planner"):
+            return _llm_result(PLANNER_OUT)
+        if sp.startswith("You are a GRP / Acumatica ERP support analyst"):
+            return _llm_result(analyst_cites_attachment,
+                               input_tokens=8000, output_tokens=1500)
+        if sp.startswith("You are a verifier"):
+            return _llm_result(VERIFIER_PASS)
+        if sp.startswith("You are a formatter"):
+            raise llm.LLMParseError("force det. fallback in this test")
+        raise AssertionError(sp[:80])
+    monkeypatch.setattr(classifier_agent.llm, "call_agent_json", dispatch)
+
+    def fake_es(index, body):
+        if index == "grp-manuals":
+            return {"hits": {"hits": [
+                {"_index": "grp-manuals", "_id": "m1", "_score": 2.0,
+                 "_source": {"module": "A", "section": "L",
+                             "content": "x"}}]}}
+        return {"hits": {"hits": [
+            {"_index": "rfs-tickets-mar-2025", "_id": "t1", "_score": 1.0,
+             "_source": {"lodge_id": "LDG-90211", "notes": "y"}}]}}
+    monkeypatch.setattr(retrieval, "_es_search", fake_es)
+    monkeypatch.setattr(retrieval.embed, "embed_text", lambda t: [0.1] * 4)
+
+    payload = {"rfs": {
+        "lodge_id": "LDG-ATT2",
+        "notes": "Depreciation posting error — see attached note.",
+        "attachments": [{"filename": "note.txt", "content_type": "text/plain",
+                         "content_b64": base64.b64encode(b"fix: unlock").decode()}],
+    }}
+    job_id = client.post("/rfs/analyze", json=payload,
+                         headers=good_headers).json()["job_id"]
+    job = queue.dequeue(timeout_seconds=1)
+    await worker._process_one(job)
+    final = queue.get_job(job_id)
+    assert final.status == JobStatus.succeeded
+
+    # The pre-format Verifier saw the attachment-citing draft → gets the files.
+    verifier_blocks = [ab for sp, ab in seen
+                       if sp.startswith("You are a verifier")]
+    assert verifier_blocks, "Verifier was never called"
+    assert any(ab for ab in verifier_blocks), \
+        "Verifier should receive file blocks when the Analyst cites an attachment"
+
 
 @pytest.mark.asyncio
 async def test_short_circuit_skips_llm_formatter(monkeypatch, client,
