@@ -1,0 +1,24 @@
+# Drop this into /etc/nginx/sites-enabled/grp-chat-tls inside the existing
+# `server { listen 443 ssl; ... }` block. Mounts the RAG-API under /rag/.
+#
+# After editing:  nginx -t && systemctl reload nginx
+
+location /rag/ {
+    # Forward everything under /rag/* to the rag-api uvicorn on 127.0.0.1:8001.
+    # Strip the /rag prefix so the upstream sees its own routes verbatim.
+    proxy_pass http://127.0.0.1:8001/;
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host  $host;
+
+    # Modest body cap; service also enforces this at the app layer.
+    client_max_body_size 512k;
+
+    # Long-running jobs are async — clients poll. So no SSE/streaming timeouts
+    # to extend.
+    proxy_read_timeout 30s;
+    proxy_send_timeout 30s;
+}

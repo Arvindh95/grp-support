@@ -1,0 +1,156 @@
+"""Redis-backed job queue + job state.
+
+Keys
+----
+rag:queue:{priority}     LIST  job_ids ordered FIFO within each priority
+rag:job:{id}             STR   JSON-encoded Job
+rag:idem:{key_hash}      STR   JSON-encoded {"job_id", "body_hash"}; TTL = idempotency_ttl
+rag:cancel:{id}          STR   "1" — pulled-from-queue worker checks this each step
+"""
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Iterable
+
+from .deps import get_config, get_redis
+from .models import Job, JobStatus, Priority
+
+
+# ── Key builders ───────────────────────────────────────────────────────────────
+
+QUEUE_ORDER: tuple[Priority, ...] = (Priority.high, Priority.normal, Priority.low)
+
+
+def _queue_key(p: Priority) -> str:
+    return f"rag:queue:{p.value}"
+
+
+def _job_key(job_id: str) -> str:
+    return f"rag:job:{job_id}"
+
+
+def _cancel_key(job_id: str) -> str:
+    return f"rag:cancel:{job_id}"
+
+
+# ── Serialization ──────────────────────────────────────────────────────────────
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _dumps(job: Job) -> str:
+    return job.model_dump_json()
+
+
+def _loads(raw: str) -> Job:
+    return Job.model_validate_json(raw)
+
+
+# ── Job CRUD ───────────────────────────────────────────────────────────────────
+
+def create_job(
+    *,
+    rfs_lodge_id: str,
+    priority: Priority,
+    client_metadata: dict,
+) -> Job:
+    cfg = get_config()
+    r = get_redis()
+    job = Job(
+        job_id=uuid.uuid4(),
+        status=JobStatus.queued,
+        created_at=_now(),
+        updated_at=_now(),
+        rfs_lodge_id=rfs_lodge_id,
+        priority=priority,
+        client_metadata=client_metadata,
+    )
+    pipe = r.pipeline()
+    pipe.set(_job_key(str(job.job_id)), _dumps(job), ex=cfg.job_ttl_seconds)
+    pipe.rpush(_queue_key(priority), str(job.job_id))
+    pipe.execute()
+    return job
+
+
+def get_job(job_id: str) -> Job | None:
+    raw = get_redis().get(_job_key(job_id))
+    if raw is None:
+        return None
+    return _loads(raw)
+
+
+def save_job(job: Job) -> None:
+    cfg = get_config()
+    job.updated_at = _now()
+    get_redis().set(_job_key(str(job.job_id)), _dumps(job),
+                    ex=cfg.job_ttl_seconds)
+
+
+def update_job(job_id: str, **fields) -> Job | None:
+    job = get_job(job_id)
+    if job is None:
+        return None
+    data = job.model_dump()
+    data.update(fields)
+    new_job = Job.model_validate(data)
+    save_job(new_job)
+    return new_job
+
+
+# ── Worker dequeue ─────────────────────────────────────────────────────────────
+
+def dequeue(timeout_seconds: int = 1, order: Iterable[Priority] = QUEUE_ORDER) -> Job | None:
+    """Blocking pop in priority order. Returns None on timeout."""
+    r = get_redis()
+    keys = [_queue_key(p) for p in order]
+    res = r.blpop(keys, timeout=timeout_seconds)
+    if not res:
+        return None
+    _, job_id = res
+    job = get_job(job_id)
+    if job is None:
+        # Job state expired/missing — drop silently.
+        return None
+    return job
+
+
+# ── Cancel ─────────────────────────────────────────────────────────────────────
+
+def mark_cancel(job_id: str) -> bool:
+    """Signal a running job to stop at next checkpoint. Returns True if signalled."""
+    r = get_redis()
+    if not r.exists(_job_key(job_id)):
+        return False
+    r.set(_cancel_key(job_id), "1", ex=3600)
+    return True
+
+
+def is_cancelled(job_id: str) -> bool:
+    return get_redis().exists(_cancel_key(job_id)) > 0
+
+
+def clear_cancel(job_id: str) -> None:
+    get_redis().delete(_cancel_key(job_id))
+
+
+# ── Queue depth (for /ready, ETA) ──────────────────────────────────────────────
+
+def queue_depth() -> dict[str, int]:
+    r = get_redis()
+    return {p.value: r.llen(_queue_key(p)) for p in QUEUE_ORDER}
+
+
+def estimate_seconds(priority: Priority, avg_job_seconds: float = 30.0,
+                     concurrency: int = 2) -> int:
+    """Rough ETA — depth of THIS and HIGHER priorities, divided by concurrency."""
+    depth = queue_depth()
+    ahead = 0
+    for p in QUEUE_ORDER:
+        ahead += depth.get(p.value, 0)
+        if p == priority:
+            break
+    return max(1, int(ahead * avg_job_seconds / max(1, concurrency)))
