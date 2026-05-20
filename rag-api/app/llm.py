@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import time
 from dataclasses import dataclass
 from typing import Any
 
-from .deps import get_anthropic
+from .deps import get_anthropic, get_config
 
 log = logging.getLogger("rag-api.llm")
 
@@ -56,6 +57,17 @@ class LLMResult:
 
 # ── Single boundary with the SDK — easy to monkeypatch ─────────────────────────
 
+# SDK exception class names treated as transient — worth retrying. 4xx errors
+# (BadRequestError, AuthenticationError, ...) have their own class names and
+# are deliberately excluded so we never retry a genuine client error.
+_TRANSIENT_EXC = frozenset({
+    "RateLimitError",        # 429
+    "InternalServerError",   # >=500, includes 529 overloaded_error
+    "APIConnectionError",
+    "APITimeoutError",
+})
+
+
 def call_messages(
     *,
     model: str,
@@ -63,14 +75,31 @@ def call_messages(
     messages: list[dict[str, Any]],
     max_tokens: int,
 ) -> Any:
-    """Thin wrapper around `client.messages.create`. Returns the SDK Message."""
+    """Thin wrapper around `client.messages.create`. Returns the SDK Message.
+
+    Retries transient failures (429 / 5xx / 529 overloaded / connection) with
+    exponential backoff + jitter so a brief Anthropic overload does not fail
+    the whole job. Client errors (4xx) are never retried."""
     client = get_anthropic()
-    return client.messages.create(
-        model=model,
-        system=system,
-        messages=messages,
-        max_tokens=max_tokens,
-    )
+    cfg = get_config()
+    attempts = max(1, cfg.llm_max_retries + 1)
+    for attempt in range(attempts):
+        try:
+            return client.messages.create(
+                model=model,
+                system=system,
+                messages=messages,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            if (e.__class__.__name__ not in _TRANSIENT_EXC
+                    or attempt == attempts - 1):
+                raise
+            delay = min(cfg.llm_retry_base_seconds * (2 ** attempt), 30.0)
+            delay += random.uniform(0.0, delay * 0.25)
+            log.warning('"llm.transient_retry attempt=%d/%d err=%s sleep=%.1fs"',
+                        attempt + 1, attempts, e.__class__.__name__, delay)
+            time.sleep(delay)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

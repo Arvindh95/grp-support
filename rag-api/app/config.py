@@ -52,6 +52,10 @@ class Config:
     # ignored and every RFS runs the full 5-agent pipeline.
     short_circuit_enabled: bool = True
 
+    # LLM transient-failure retry (429 / 5xx / 529 overloaded / connection).
+    llm_max_retries: int = 5
+    llm_retry_base_seconds: float = 4.0
+
 
 def load_config() -> Config:
     return Config(
@@ -75,4 +79,6 @@ def load_config() -> Config:
         trace_index_prefix=os.environ.get("TRACE_INDEX_PREFIX", "rag-api-trace"),
         short_circuit_enabled=_bool(os.environ.get("SHORT_CIRCUIT_ENABLED"),
                                     default=True),
+        llm_max_retries=int(os.environ.get("LLM_MAX_RETRIES", "5")),
+        llm_retry_base_seconds=float(os.environ.get("LLM_RETRY_BASE_SECONDS", "4.0")),
     )

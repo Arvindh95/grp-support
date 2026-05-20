@@ -113,6 +113,60 @@ def test_auth_error_mapped_to_terminal(monkeypatch):
                             user_payload="y", max_tokens=200)
 
 
+def test_call_messages_retries_transient(monkeypatch):
+    """A transient 5xx/529 is retried with backoff until it succeeds."""
+    class InternalServerError(Exception):
+        pass
+    calls = {"n": 0}
+    def create(**kw):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise InternalServerError("Error code: 529 - overloaded")
+        return _mk_msg('{"ok":1}')
+    fake_client = SimpleNamespace(messages=SimpleNamespace(create=create))
+    monkeypatch.setattr(llm, "get_anthropic", lambda: fake_client)
+    monkeypatch.setattr(llm.time, "sleep", lambda _s: None)
+
+    msg = llm.call_messages(model="m", system=[], messages=[], max_tokens=10)
+    assert calls["n"] == 3   # failed twice, succeeded on the third try
+    assert msg.stop_reason == "end_turn"
+
+
+def test_call_messages_does_not_retry_client_error(monkeypatch):
+    """A 4xx client error is raised immediately — never retried."""
+    class BadRequestError(Exception):
+        pass
+    calls = {"n": 0}
+    def create(**kw):
+        calls["n"] += 1
+        raise BadRequestError("Error code: 400 - bad request")
+    fake_client = SimpleNamespace(messages=SimpleNamespace(create=create))
+    monkeypatch.setattr(llm, "get_anthropic", lambda: fake_client)
+    monkeypatch.setattr(llm.time, "sleep", lambda _s: None)
+
+    with pytest.raises(BadRequestError):
+        llm.call_messages(model="m", system=[], messages=[], max_tokens=10)
+    assert calls["n"] == 1   # not retried
+
+
+def test_call_messages_gives_up_after_max_retries(monkeypatch):
+    """A persistent transient error is raised after exhausting retries."""
+    class InternalServerError(Exception):
+        pass
+    calls = {"n": 0}
+    def create(**kw):
+        calls["n"] += 1
+        raise InternalServerError("529 overloaded")
+    fake_client = SimpleNamespace(messages=SimpleNamespace(create=create))
+    monkeypatch.setattr(llm, "get_anthropic", lambda: fake_client)
+    monkeypatch.setattr(llm.time, "sleep", lambda _s: None)
+
+    with pytest.raises(InternalServerError):
+        llm.call_messages(model="m", system=[], messages=[], max_tokens=10)
+    # 1 initial + llm_max_retries (default 5) = 6 attempts.
+    assert calls["n"] == 6
+
+
 def test_cached_system_marks_ephemeral():
     blocks = llm.cached_system("hello")
     assert blocks == [{"type": "text", "text": "hello",
