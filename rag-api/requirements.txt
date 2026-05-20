@@ -5,6 +5,7 @@ requests==2.32.3
 redis==5.2.1
 anthropic==0.42.0
 pyyaml==6.0.2
+email-validator==2.2.0
 
 # tests
 pytest==8.3.4
