@@ -13,7 +13,8 @@ ExecStart=/opt/grp-chat/rag-api/.venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 \
     --port 8001 \
     --workers 1 \
-    --log-level info
+    --log-level info \
+    --root-path /rag
 Restart=on-failure
 RestartSec=3
 KillSignal=SIGINT
