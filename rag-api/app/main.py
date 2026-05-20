@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import logging
 import os
+import pathlib
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from .errors import error_envelope
 from .models import ErrorCode
@@ -29,10 +32,26 @@ _setup_logging()
 app = FastAPI(
     title="GRP RAG-API",
     version="0.1.0",
-    docs_url="/docs",
+    docs_url=None,        # replaced by a self-hosted Swagger UI below
     redoc_url=None,
     openapi_url="/openapi.json",
 )
+
+# Self-hosted Swagger UI assets. The site CSP is `script-src 'self'`, so the
+# default CDN-loaded Swagger page renders blank — serve the bundle locally.
+_STATIC_DIR = pathlib.Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+
+@app.get("/docs", include_in_schema=False)
+async def swagger_ui(request: Request):
+    root = request.scope.get("root_path", "").rstrip("/")
+    return get_swagger_ui_html(
+        openapi_url=f"{root}{app.openapi_url}",
+        title="GRP RAG-API — API reference",
+        swagger_js_url=f"{root}/static/swagger-ui-bundle.js",
+        swagger_css_url=f"{root}/static/swagger-ui.css",
+    )
 
 
 # ── Request ID ─────────────────────────────────────────────────────────────────
