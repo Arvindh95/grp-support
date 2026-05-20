@@ -302,6 +302,9 @@ Review every recommended_action and every citation:
 Rules:
   - Reference ONLY step numbers and cit-ids that appear in the given Analysis.
     Never mention a step or cit-id that is not present.
+  - The Analysis has NO "claims" — it only has recommended_actions and
+    citations. Never write "claim-N" / "Claim-N" or any other identifier.
+    Refer to an action as "Step N" and a citation as "cit-N", nothing else.
   - Flag only real problems. A step well supported by a strong citation gets
     no flag. If everything checks out, return an empty flags array.
 
