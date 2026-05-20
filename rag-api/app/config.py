@@ -47,6 +47,10 @@ class Config:
     log_level: str
     trace_index_prefix: str
 
+    # Pipeline — when False, the Classifier's short_circuit verdict is
+    # ignored and every RFS runs the full 5-agent pipeline.
+    short_circuit_enabled: bool = True
+
 
 def load_config() -> Config:
     return Config(
@@ -66,4 +70,6 @@ def load_config() -> Config:
         monthly_token_budget=int(os.environ.get("MONTHLY_TOKEN_BUDGET", "0")),
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
         trace_index_prefix=os.environ.get("TRACE_INDEX_PREFIX", "rag-api-trace"),
+        short_circuit_enabled=_bool(os.environ.get("SHORT_CIRCUIT_ENABLED"),
+                                    default=True),
     )

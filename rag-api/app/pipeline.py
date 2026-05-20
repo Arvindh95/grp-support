@@ -17,6 +17,7 @@ import asyncio
 import logging
 
 from . import retrieval
+from .deps import get_config
 from .agents import analyst as analyst_agent
 from .agents import classifier as classifier_agent
 from .agents import formatter as llm_formatter
@@ -51,7 +52,11 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
     trace.append(cls_step)
     _add_usage(usage, cls_step)
 
-    if cls_out.short_circuit:
+    if cls_out.short_circuit and not get_config().short_circuit_enabled:
+        log.info('"pipeline.short_circuit_overridden reason=%s — running full pipeline"',
+                 cls_out.short_circuit_reason)
+
+    if cls_out.short_circuit and get_config().short_circuit_enabled:
         log.info('"pipeline.short_circuit reason=%s"', cls_out.short_circuit_reason)
         analysis = det_formatter.format_short_circuit(cls_out)
         trace.extend(_skipped_steps_for_short_circuit())
