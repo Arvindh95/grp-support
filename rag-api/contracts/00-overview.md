@@ -5,8 +5,8 @@ Five agents in a fixed order. Each agent reads JSON from the prior step plus ret
 ```
 RFS  →  Classifier  →  Retrieval Planner  →  Analyst  →  Verifier  →  Formatter  →  Analysis
         (haiku)        (haiku)              (sonnet)   (haiku)     (haiku)
-        short-circuit  builds ES queries    reasons,   checks      shapes
-        on duplicate   + rerank knobs       cites      claims      Analysis JSON
+        labels RFS     builds ES queries    reasons,   checks      shapes
+                      + rerank knobs       cites      claims      Analysis JSON
                                                        + flags
 ```
 
@@ -35,7 +35,7 @@ Analysis          ⇢ defined in openapi.yaml#/components/schemas/Analysis
 ## Pipeline contract (orchestrator-side)
 
 1. Orchestrator receives RFS.
-2. Calls Classifier. If `short_circuit = true`, jump to Formatter with the short-circuit payload, skip Planner/Analyst/Verifier.
+2. Calls Classifier.
 3. Calls Retrieval Planner. Gets list of ES query plans (kNN seeds + lexical queries + filters).
 4. Orchestrator executes the plans against ES, deduplicates results, packs top-K chunks into `retrieved_context`.
 5. Calls Analyst with `retrieved_context`. Gets draft analysis + claim→citation map.

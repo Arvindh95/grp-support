@@ -67,43 +67,6 @@ def _truncate(text: str | None, max_chars: int) -> str:
     return text[: max_chars - 3] + "..."
 
 
-def format_short_circuit(classifier_output: ClassifierOutput) -> Analysis:
-    """Build an Analysis directly from a short-circuited Classifier output."""
-    payload = classifier_output.short_circuit_payload or {}
-    suggested = payload.get("suggested_response") or (
-        f"Classifier short-circuited: {classifier_output.short_circuit_reason}."
-    )
-    citations: list[Citation] = []
-    related: list[RelatedRFS] = []
-    if classifier_output.category == "duplicate" and payload.get("duplicate_of"):
-        dup_id = payload["duplicate_of"]
-        citations.append(Citation(
-            id="cit-1",
-            source=CitationSource.rfs_ticket,
-            locator={"lodge_id": dup_id},
-            snippet=_snippet(f"Duplicate of {dup_id}", _MAX_SNIPPET),
-            score=classifier_output.confidence,
-        ))
-        related.append(RelatedRFS(lodge_id=dup_id,
-                                  score=classifier_output.confidence,
-                                  snippet=_snippet(suggested, _MAX_RELATED_SNIPPET)))
-    return Analysis(
-        category=classifier_output.category,
-        confidence=classifier_output.confidence,
-        summary=_truncate(suggested, _MAX_SUMMARY) or "Short-circuited.",
-        likely_cause=None,
-        recommended_actions=[RecommendedAction(
-            step=1,
-            detail=_truncate(suggested, _MAX_ACTION_DETAIL)
-                or "See original ticket.",
-            source_refs=[c.id for c in citations],
-        )],
-        citations=citations,
-        related_rfs=related,
-        verifier_flags=[],
-    )
-
-
 def format_analysis(
     classifier_output: ClassifierOutput,
     analyst_output: AnalystOutput,

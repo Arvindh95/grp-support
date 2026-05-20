@@ -7,9 +7,6 @@ Status by week:
          Verifier still stubbed (always pass) — real Verifier lands W8.
          LLM Formatter lands W9; the deterministic one becomes the fallback.
 
-Short-circuit path: Classifier short_circuit=true bypasses Planner / retrieval
-/ Analyst / Verifier; deterministic Formatter builds the Analysis directly
-from the Classifier's payload.
 """
 from __future__ import annotations
 
@@ -53,17 +50,6 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
     cls_out, cls_step = await asyncio.to_thread(classifier_agent.classify, rfs)
     trace.append(cls_step)
     _add_usage(usage, cls_step)
-
-    if cls_out.short_circuit and not get_config().short_circuit_enabled:
-        log.info('"pipeline.short_circuit_overridden reason=%s — running full pipeline"',
-                 cls_out.short_circuit_reason)
-
-    if cls_out.short_circuit and get_config().short_circuit_enabled:
-        log.info('"pipeline.short_circuit reason=%s"', cls_out.short_circuit_reason)
-        analysis = det_formatter.format_short_circuit(cls_out)
-        trace.extend(_skipped_steps_for_short_circuit())
-        usage.estimated_cost_rm = _estimate_cost_rm(usage)
-        return analysis, trace, usage
 
     # ── Attachments — decode the caller's files once; the same content
     #    blocks are reused by the Analyst, the Verifier, and the final
@@ -259,24 +245,6 @@ def _degrade_to_flag(v):
         flags=flags,
         must_retry_reason=None,
     )
-
-
-def _skipped_steps_for_short_circuit() -> list[AgentStep]:
-    return [
-        AgentStep(agent=AgentName.retrieval_planner,
-                  model="(skipped)", status=AgentStepStatus.ok,
-                  duration_ms=0, note="skipped: short-circuit"),
-        AgentStep(agent=AgentName.analyst,
-                  model="(skipped)", status=AgentStepStatus.ok,
-                  duration_ms=0, note="skipped: short-circuit"),
-        AgentStep(agent=AgentName.verifier,
-                  model="(skipped)", status=AgentStepStatus.ok,
-                  duration_ms=0, note="skipped: short-circuit"),
-        AgentStep(agent=AgentName.formatter,
-                  model="deterministic (short-circuit)",
-                  status=AgentStepStatus.ok,
-                  duration_ms=0, note="short-circuit"),
-    ]
 
 
 def _add_usage(u: Usage, s: AgentStep) -> None:

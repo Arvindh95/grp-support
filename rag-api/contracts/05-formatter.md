@@ -16,21 +16,7 @@ Shape the Analyst + Verifier outputs into the final `Analysis` JSON exposed in `
   "classifier_output": { /* full output */ },
   "analyst_output": { /* full output */ },
   "verifier_output": { /* full output */ },
-  "retrieved_context": [ /* same as Analyst */ ],
-  "short_circuit_payload": null
-}
-```
-
-When the Classifier short-circuited, the Formatter receives:
-
-```jsonc
-{
-  "rfs_lodge_id": "LDG-44021",
-  "classifier_output": { /* with short_circuit=true */ },
-  "analyst_output": null,
-  "verifier_output": null,
-  "retrieved_context": [],
-  "short_circuit_payload": { "duplicate_of": "LDG-12345", "suggested_response": "..." }
+  "retrieved_context": [ /* same as Analyst */ ]
 }
 ```
 
@@ -79,8 +65,6 @@ Final `Analysis` JSON exactly as defined in `openapi.yaml#/components/schemas/An
 }
 ```
 
-For short-circuit input, Formatter produces a much shorter Analysis with `category="duplicate"` (or `"how-to"`), one-step recommended_actions, and citations pointing at the duplicate ticket.
-
 ## Rules
 
 1. **No new content.** Formatter does not invent claims or actions. It only restructures.
@@ -102,8 +86,6 @@ Output schema: { ... full Analysis schema inlined ... }
 Rules:
   - Every source_refs[] entry must reference a citations[].id.
   - Snippets are at most 400 characters.
-  - If short_circuit_payload is non-null, ignore analyst/verifier and produce
-    a one-step Analysis based on the payload.
   - JSON only.
 ```
 
@@ -119,5 +101,5 @@ Fallback: if the Formatter fails twice, the orchestrator falls back to a determi
 
 ## Caching boundary
 
-Cached prefix (~2,400 tokens): system prompt + Analysis schema + 2 exemplars (one full, one short-circuit).
+Cached prefix (~2,400 tokens): system prompt + Analysis schema + exemplars.
 Dynamic suffix (~600 tokens): analyst output (already JSON, slim) + verifier output + chunk locators.

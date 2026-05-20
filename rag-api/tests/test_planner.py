@@ -21,9 +21,6 @@ def _rfs():
 
 def _classifier_output(category="license-error"):
     return ClassifierOutput(category=category, confidence=0.8,
-                            short_circuit=False,
-                            short_circuit_reason=None,
-                            short_circuit_payload=None,
                             tags=[], language="en")
 
 

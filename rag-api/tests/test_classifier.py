@@ -1,8 +1,7 @@
-"""Classifier agent — schema validation, short-circuit, error tolerance."""
+"""Classifier agent — schema validation and error tolerance."""
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 
 import pytest
 
@@ -11,7 +10,6 @@ from app.agents import classifier
 from app.agents.classifier import (
     CATEGORIES,
     ClassifierOutput,
-    DuplicateCandidate,
     _validate,
 )
 from app.llm import LLMResult, LLMUsage
@@ -40,8 +38,7 @@ def _llm_returning(parsed: dict, *, input_tokens=100, output_tokens=50,
 def test_validate_accepts_well_formed():
     out = _validate({
         "category": "license-error", "confidence": 0.8,
-        "short_circuit": False, "short_circuit_reason": None,
-        "short_circuit_payload": None, "tags": ["billing"], "language": "en",
+        "tags": ["billing"], "language": "en",
     })
     assert out.category == "license-error"
     assert out.confidence == 0.8
@@ -49,27 +46,12 @@ def test_validate_accepts_well_formed():
 
 def test_validate_rejects_unknown_category():
     with pytest.raises(ValueError):
-        _validate({"category": "purple", "confidence": 0.5,
-                   "short_circuit": False})
+        _validate({"category": "purple", "confidence": 0.5})
 
 
 def test_validate_rejects_bad_confidence():
     with pytest.raises(ValueError):
-        _validate({"category": "other", "confidence": 1.5,
-                   "short_circuit": False})
-
-
-def test_validate_requires_reason_when_short_circuit():
-    with pytest.raises(ValueError):
-        _validate({"category": "duplicate", "confidence": 0.9,
-                   "short_circuit": True, "short_circuit_reason": None})
-
-
-def test_validate_rejects_orphan_reason_when_not_sc():
-    with pytest.raises(ValueError):
-        _validate({"category": "other", "confidence": 0.5,
-                   "short_circuit": False,
-                   "short_circuit_reason": "shouldnt be here"})
+        _validate({"category": "other", "confidence": 1.5})
 
 
 # ── classify() with mocked LLM ────────────────────────────────────────────────
@@ -79,43 +61,14 @@ def test_classify_happy_path(monkeypatch):
         classifier.llm, "call_agent_json",
         lambda **kw: _llm_returning({
             "category": "license-error", "confidence": 0.82,
-            "short_circuit": False, "short_circuit_reason": None,
-            "short_circuit_payload": None,
             "tags": ["billing", "renewal"], "language": "en",
         }),
     )
     out, step = classifier.classify(_rfs())
     assert isinstance(out, ClassifierOutput)
     assert out.category == "license-error"
-    assert out.short_circuit is False
     assert step.status == AgentStepStatus.ok
     assert step.input_tokens == 100
-
-
-def test_classify_short_circuit_duplicate(monkeypatch):
-    captured = {}
-    def fake(**kw):
-        captured.update(kw)
-        return _llm_returning({
-            "category": "duplicate", "confidence": 0.95,
-            "short_circuit": True,
-            "short_circuit_reason": "near_duplicate_of_LDG-99",
-            "short_circuit_payload": {
-                "duplicate_of": "LDG-99",
-                "suggested_response": "Same as LDG-99",
-            },
-            "tags": ["duplicate"], "language": "en",
-        })
-    monkeypatch.setattr(classifier.llm, "call_agent_json", fake)
-
-    dupes = [DuplicateCandidate(lodge_id="LDG-99", score=0.93,
-                                snippet="License renewal stuck")]
-    out, step = classifier.classify(_rfs(), duplicate_candidates=dupes)
-    assert out.short_circuit
-    assert out.short_circuit_payload["duplicate_of"] == "LDG-99"
-    assert step.status == AgentStepStatus.short_circuit
-    # Make sure dupe candidates landed in the LLM input.
-    assert "LDG-99" in captured["user_payload"]["duplicate_candidates"][0]["lodge_id"]
 
 
 def test_classify_soft_fails_on_unparseable(monkeypatch):
@@ -131,8 +84,7 @@ def test_classify_soft_fails_on_unparseable(monkeypatch):
 def test_classify_soft_fails_on_schema_violation(monkeypatch):
     monkeypatch.setattr(
         classifier.llm, "call_agent_json",
-        lambda **kw: _llm_returning({"category": "made-up-cat", "confidence": 0.5,
-                                     "short_circuit": False}),
+        lambda **kw: _llm_returning({"category": "made-up-cat", "confidence": 0.5}),
     )
     out, step = classifier.classify(_rfs())
     assert out.category == "other"

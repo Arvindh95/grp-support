@@ -11,7 +11,6 @@ from app.agents.analyst import (
 from app.agents.classifier import ClassifierOutput
 from app.agents.formatter_deterministic import (
     format_analysis,
-    format_short_circuit,
 )
 from app.models import (
     Analysis,
@@ -24,9 +23,6 @@ from app.retrieval import RetrievedChunk
 
 def _classifier(category="license-error", conf=0.85):
     return ClassifierOutput(category=category, confidence=conf,
-                            short_circuit=False,
-                            short_circuit_reason=None,
-                            short_circuit_payload=None,
                             tags=[], language="en")
 
 
@@ -162,33 +158,3 @@ def test_format_falls_back_to_default_action_when_empty():
     assert "Manual triage" in a.recommended_actions[0].detail
 
 
-# ── short-circuit path ────────────────────────────────────────────────────────
-
-def test_short_circuit_duplicate_produces_citation():
-    cls = ClassifierOutput(
-        category="duplicate", confidence=0.95, short_circuit=True,
-        short_circuit_reason="near_duplicate_of_LDG-77",
-        short_circuit_payload={
-            "duplicate_of": "LDG-77",
-            "suggested_response": "Same as LDG-77, check resolution there.",
-        },
-        tags=["duplicate"], language="en",
-    )
-    a = format_short_circuit(cls)
-    assert a.category == "duplicate"
-    assert a.citations[0].locator["lodge_id"] == "LDG-77"
-    assert a.related_rfs[0].lodge_id == "LDG-77"
-    assert len(a.recommended_actions) == 1
-
-
-def test_short_circuit_how_to_no_duplicate():
-    cls = ClassifierOutput(
-        category="how-to", confidence=0.92, short_circuit=True,
-        short_circuit_reason="trivial_how_to",
-        short_circuit_payload={"suggested_response": "Click Settings > Reports."},
-        tags=["how-to"], language="en",
-    )
-    a = format_short_circuit(cls)
-    assert a.category == "how-to"
-    assert a.citations == []
-    assert "Click Settings" in a.recommended_actions[0].detail

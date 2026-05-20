@@ -56,7 +56,6 @@ class AgentName(str, Enum):
 
 class AgentStepStatus(str, Enum):
     ok = "ok"
-    short_circuit = "short_circuit"
     retried = "retried"
     failed = "failed"
 

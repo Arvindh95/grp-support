@@ -35,8 +35,6 @@ def _llm_result(parsed, *, input_tokens=200, output_tokens=80, cache_read=0):
 
 CLASSIFIER_OUT = {
     "category": "license-error", "confidence": 0.82,
-    "short_circuit": False, "short_circuit_reason": None,
-    "short_circuit_payload": None,
     "tags": ["billing"], "language": "en",
 }
 
@@ -312,45 +310,6 @@ async def test_analyst_unsupported_fallback_still_produces_analysis(
     assert "unsupported_claim" in flags
     # Still has at least one action (deterministic Formatter floor)
     assert len(a.recommended_actions) >= 1
-
-
-@pytest.mark.asyncio
-async def test_short_circuit_path_no_analyst(monkeypatch, client, good_headers,
-                                             sample_rfs):
-    short_circuit_out = {
-        "category": "duplicate", "confidence": 0.95,
-        "short_circuit": True,
-        "short_circuit_reason": "near_duplicate_of_LDG-77",
-        "short_circuit_payload": {
-            "duplicate_of": "LDG-77",
-            "suggested_response": "Same as LDG-77.",
-        },
-        "tags": ["duplicate"], "language": "en",
-    }
-    def dispatch(**kw):
-        sp = kw.get("system_prompt", "")
-        if sp.startswith("You are a support-ticket classifier"):
-            return _llm_result(short_circuit_out)
-        if sp.startswith("You are a GRP / Acumatica ERP support analyst"):
-            raise AssertionError("Analyst should be skipped")
-        if sp.startswith("You are a retrieval-planner"):
-            raise AssertionError("Planner should be skipped")
-        raise AssertionError(sp[:80])
-    monkeypatch.setattr(classifier_agent.llm, "call_agent_json", dispatch)
-    def es_called(index, body):
-        raise AssertionError("ES should be skipped on short_circuit")
-    monkeypatch.setattr(retrieval, "_es_search", es_called)
-
-    job_id = client.post("/rfs/analyze", json=sample_rfs,
-                         headers=good_headers).json()["job_id"]
-    job = queue.dequeue(timeout_seconds=1)
-    await worker._process_one(job)
-    final = queue.get_job(job_id)
-
-    assert final.status == JobStatus.succeeded
-    assert final.result.category == "duplicate"
-    assert any(c.locator.get("lodge_id") == "LDG-77"
-               for c in final.result.citations)
 
 
 @pytest.mark.asyncio
@@ -826,34 +785,3 @@ async def test_verifier_gets_files_when_analyst_cites_attachment(
         "Verifier should receive file blocks when the Analyst cites an attachment"
 
 
-@pytest.mark.asyncio
-async def test_short_circuit_skips_llm_formatter(monkeypatch, client,
-                                                good_headers, sample_rfs):
-    """LLM Formatter must NOT be called on the short-circuit path —
-    deterministic format_short_circuit handles it."""
-    short_circuit_out = {
-        "category": "duplicate", "confidence": 0.95, "short_circuit": True,
-        "short_circuit_reason": "near_duplicate_of_LDG-77",
-        "short_circuit_payload": {
-            "duplicate_of": "LDG-77",
-            "suggested_response": "Same as LDG-77.",
-        },
-        "tags": ["duplicate"], "language": "en",
-    }
-    def dispatch(**kw):
-        sp = kw.get("system_prompt", "")
-        if sp.startswith("You are a support-ticket classifier"):
-            return _llm_result(short_circuit_out)
-        if sp.startswith("You are a formatter"):
-            raise AssertionError("LLM Formatter should be skipped on short-circuit")
-        raise AssertionError(sp[:80])
-    monkeypatch.setattr(classifier_agent.llm, "call_agent_json", dispatch)
-
-    job_id = client.post("/rfs/analyze", json=sample_rfs,
-                         headers=good_headers).json()["job_id"]
-    job = queue.dequeue(timeout_seconds=1)
-    await worker._process_one(job)
-    final = queue.get_job(job_id)
-    assert final.status == JobStatus.succeeded
-    fmt = next(s for s in final.agent_trace if s.agent.value == "formatter")
-    assert "short-circuit" in fmt.model

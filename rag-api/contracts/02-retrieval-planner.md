@@ -103,7 +103,6 @@ Rules:
   - For manual queries, use mode="hybrid" and rerank="mmr" by default.
   - For ticket queries, use mode="knn" unless the Classifier set category
     to "how-to" (then use mode="hybrid" and prefer manuals).
-  - If Classifier short-circuit was true, this agent is not called.
 ```
 
 ## Error modes

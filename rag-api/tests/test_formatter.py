@@ -20,9 +20,6 @@ from app.retrieval import RetrievedChunk
 
 def _classifier():
     return ClassifierOutput(category="license-error", confidence=0.85,
-                            short_circuit=False,
-                            short_circuit_reason=None,
-                            short_circuit_payload=None,
                             tags=["billing"], language="en")
 
 

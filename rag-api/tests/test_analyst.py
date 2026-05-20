@@ -30,9 +30,6 @@ def _rfs():
 
 def _classifier():
     return ClassifierOutput(category="license-error", confidence=0.8,
-                            short_circuit=False,
-                            short_circuit_reason=None,
-                            short_circuit_payload=None,
                             tags=[], language="en")
 
 

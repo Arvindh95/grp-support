@@ -28,7 +28,7 @@ Webhook callback (if `callback_url` provided on submit): service POSTs result to
 - `openapi.yaml` — full OpenAPI 3.1 spec. Source of truth for HTTP surface.
 - `contracts/` — per-agent input/output contracts.
   - `00-overview.md` — pipeline diagram + shared types
-  - `01-classifier.md` — Haiku, categorize + short-circuit
+  - `01-classifier.md` — Haiku, categorize
   - `02-retrieval-planner.md` — Haiku, plan ES queries
   - `03-analyst.md` — Sonnet, reasoning + draft analysis (cached prompt)
   - `04-verifier.md` — Haiku, citation + claim check

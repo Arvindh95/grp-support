@@ -70,7 +70,7 @@ HARD RULES:
 
 Use the Classifier output to bias the plan:
   - category="how-to" → prefer manuals, set max_chunks of tickets lower.
-  - category="duplicate" / short_circuit=true → you should not be called.
+  - category="duplicate" → include similar tickets so the Analyst can compare.
   - category="performance" or "integration-failure" → include grp-code if available.
 
 Keep `lexical.must` query strings concise (a few keywords). Avoid copy-pasting

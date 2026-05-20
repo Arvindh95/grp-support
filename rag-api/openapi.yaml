@@ -432,12 +432,12 @@ components:
         model: { type: string }
         status:
           type: string
-          enum: [ok, short_circuit, retried, failed]
+          enum: [ok, retried, failed]
         duration_ms: { type: integer }
         input_tokens:           { type: integer }
         input_cache_read_tokens: { type: integer }
         output_tokens:          { type: integer }
-        note: { type: string, description: Free-form (e.g., "short-circuit: duplicate of LDG-12345"). }
+        note: { type: string, description: Free-form (e.g., "verdict=flag"). }
 
     Usage:
       type: object
