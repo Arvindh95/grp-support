@@ -74,7 +74,7 @@ Schema:
   "recommended_actions": [
     {
       "step": <int, 1-based>,
-      "detail": "<concrete next step, <=600 chars>",
+      "detail": "<concrete next step, <=2000 chars; finish every sentence>",
       "citations": ["<chunk_id>", ...]    // >=1 entry, all from retrieved_context
     },
     ...

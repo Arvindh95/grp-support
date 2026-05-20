@@ -238,5 +238,5 @@ def test_format_via_llm_payload_is_compact(monkeypatch):
     p = captured["payload"]
     assert len(p["analyst_output"]["summary"]) <= 600
     assert len(p["analyst_output"]["likely_cause"]) <= 1000
-    assert len(p["analyst_output"]["recommended_actions"][0]["detail"]) <= 600
+    assert len(p["analyst_output"]["recommended_actions"][0]["detail"]) <= 2000
     assert len(p["retrieved_context"][0]["text"]) <= 500

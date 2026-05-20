@@ -156,7 +156,7 @@ class Citation(BaseModel):
 class RecommendedAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
     step: int
-    detail: str = Field(max_length=600)
+    detail: str = Field(max_length=2000)
     source_refs: list[str] = Field(default_factory=list)
 
 

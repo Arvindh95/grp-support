@@ -109,11 +109,11 @@ def test_format_truncates_long_fields():
     ao = _analyst_output()
     ao.summary = "x" * 1000
     ao.likely_cause = "y" * 2000
-    ao.recommended_actions[0].detail = "z" * 1000
+    ao.recommended_actions[0].detail = "z" * 3000
     a = format_analysis(_classifier(), ao, _chunks())
     assert len(a.summary) <= 600
     assert len(a.likely_cause) <= 1000
-    assert len(a.recommended_actions[0].detail) <= 600
+    assert len(a.recommended_actions[0].detail) <= 2000
 
 
 def test_format_drops_unresolvable_citations():

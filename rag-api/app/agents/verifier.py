@@ -32,7 +32,9 @@ from .analyst import AnalystOutput
 log = logging.getLogger("rag-api.agent.verifier")
 
 MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 600
+# Headroom for a multi-flag rubric / final-review response — 600 was tight
+# enough to force a wasteful internal parse-retry on busy analyses.
+MAX_TOKENS = 1500
 
 VERDICT_PASS = "pass"
 VERDICT_FLAG = "flag"
@@ -136,7 +138,7 @@ def _compact_analyst(a: AnalystOutput) -> dict[str, Any]:
         "confidence": a.confidence,
         "recommended_actions": [
             {"step": x.step,
-             "detail": x.detail[:400],
+             "detail": x.detail[:2000],
              "citations": list(x.citations)}
             for x in a.recommended_actions
         ],
@@ -334,7 +336,7 @@ def _compact_analysis(a: Analysis) -> dict[str, Any]:
         "confidence": a.confidence,
         "summary": a.summary[:400],
         "recommended_actions": [
-            {"step": x.step, "detail": x.detail[:400],
+            {"step": x.step, "detail": x.detail[:2000],
              "source_refs": list(x.source_refs)}
             for x in a.recommended_actions
         ],

@@ -222,7 +222,7 @@ def test_verify_input_compaction_keeps_token_budget(monkeypatch):
 
     p = captured["payload"]
     assert len(p["analyst_output"]["summary"]) <= 400
-    assert len(p["analyst_output"]["recommended_actions"][0]["detail"]) <= 400
+    assert len(p["analyst_output"]["recommended_actions"][0]["detail"]) <= 2000
     assert len(p["analyst_output"]["claims"][0]["text"]) <= 400
     assert len(p["analyst_output"]["open_questions"]) <= 3
     assert len(p["retrieved_context"][0]["text"]) <= 600

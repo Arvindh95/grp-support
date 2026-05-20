@@ -64,7 +64,7 @@ Schema (must match exactly):
   "recommended_actions": [
     {
       "step": <int>,
-      "detail": "<<=600 chars, copy or trim analyst action.detail>",
+      "detail": "<<=2000 chars, copy the analyst action.detail in full — do NOT truncate mid-sentence>",
       "source_refs": ["cit-1", "cit-2", ...]   // must reference citations[].id
     },
     ...    // 1 to 10 items
@@ -139,7 +139,7 @@ def _compact_payload(
             "likely_cause": (analyst_output.likely_cause or "")[:1000] or None,
             "confidence": analyst_output.confidence,
             "recommended_actions": [
-                {"step": a.step, "detail": a.detail[:600],
+                {"step": a.step, "detail": a.detail[:2000],
                  "citations": list(a.citations)}
                 for a in analyst_output.recommended_actions
             ],
