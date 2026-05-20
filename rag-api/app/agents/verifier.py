@@ -22,6 +22,7 @@ from ..models import (
     AgentName,
     AgentStep,
     AgentStepStatus,
+    Analysis,
     VerifierFlag,
     VerifierFlagKind,
 )
@@ -277,6 +278,108 @@ def verify(
         ),
     )
     return out, step
+
+
+# ── Final review (post-Formatter) ─────────────────────────────────────────────
+
+FINAL_REVIEW_PROMPT = """You are a verifier performing the FINAL review of a GRP / Acumatica ERP support Analysis.
+
+You receive the FINAL Analysis object that will be returned to the user, plus
+the retrieved evidence chunks. Output verifier flags that reference the
+Analysis EXACTLY as given — its own step numbers and citation ids (cit-1, ...).
+
+Output ONE JSON object only. No prose, no markdown fences.
+
+Review every recommended_action and every citation:
+  - weak_citation: an action's source_refs point at a citation whose score is
+    low (below 0.5) OR whose snippet does not actually support the action.
+  - unsupported_claim: an action has empty source_refs, or none of its cited
+    snippets support what the step instructs.
+  - retrieval_gap: the Analysis needs evidence on a topic that no chunk covers.
+  - low_confidence: the stated confidence looks too high for the citation
+    quality.
+
+Rules:
+  - Reference ONLY step numbers and cit-ids that appear in the given Analysis.
+    Never mention a step or cit-id that is not present.
+  - Flag only real problems. A step well supported by a strong citation gets
+    no flag. If everything checks out, return an empty flags array.
+
+Schema:
+{
+  "flags": [
+    { "kind": "unsupported_claim" | "weak_citation" | "low_confidence" | "retrieval_gap",
+      "detail": "<short explanation citing step N and/or cit-N>" }
+  ]
+}
+"""
+
+
+def _compact_analysis(a: Analysis) -> dict[str, Any]:
+    return {
+        "category": a.category,
+        "confidence": a.confidence,
+        "summary": a.summary[:400],
+        "recommended_actions": [
+            {"step": x.step, "detail": x.detail[:400],
+             "source_refs": list(x.source_refs)}
+            for x in a.recommended_actions
+        ],
+        "citations": [
+            {"id": c.id, "source": c.source.value,
+             "snippet": c.snippet[:300], "score": c.score}
+            for c in a.citations
+        ],
+    }
+
+
+def verify_analysis(
+    analysis: Analysis,
+    chunks: Sequence[RetrievedChunk],
+    category: str,
+) -> tuple[list[VerifierFlag], AgentStep]:
+    """Re-verify the FINAL Analysis (post-Formatter). Returns flags that
+    reference the Analysis's own step numbers / cit-ids — unlike the
+    pre-format Verifier, whose flags point at the Analyst draft's numbering.
+
+    Flag-only: the pass/retry verdict was already settled before formatting.
+    Soft-fails to an empty flag list — never blocks the pipeline.
+    """
+    payload = {
+        "category": category,
+        "analysis": _compact_analysis(analysis),
+        "retrieved_context": _compact_chunks(chunks),
+    }
+    try:
+        res = llm.call_agent_json(
+            model=MODEL, system_prompt=FINAL_REVIEW_PROMPT,
+            user_payload=payload, max_tokens=MAX_TOKENS,
+        )
+    except llm.LLMParseError as e:
+        log.warning('"verifier.final_review_unparseable err=%s"', e)
+        return [], AgentStep(
+            agent=AgentName.verifier, model=MODEL,
+            status=AgentStepStatus.failed, duration_ms=0,
+            note=f"final_review soft_fail: {e}",
+        )
+
+    parsed = res.parsed or {}
+    raw_flags = parsed.get("flags")
+    flags: list[VerifierFlag] = []
+    if isinstance(raw_flags, list):
+        for f in raw_flags:
+            pf = _parse_flag(f)
+            if pf is not None:
+                flags.append(pf)
+    step = AgentStep(
+        agent=AgentName.verifier, model=MODEL,
+        status=AgentStepStatus.ok, duration_ms=res.duration_ms,
+        input_tokens=res.usage.input_tokens,
+        input_cache_read_tokens=res.usage.input_cache_read_tokens,
+        output_tokens=res.usage.output_tokens,
+        note=f"final_review flags={len(flags)}",
+    )
+    return flags, step
 
 
 def _soft_fail(*, reason: str, usage: "llm.LLMUsage | None",

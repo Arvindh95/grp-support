@@ -201,10 +201,10 @@ async def test_full_pipeline_produces_real_analysis(monkeypatch, client,
     # related_rfs derived from retrieval, not from Analyst output.
     assert any(r.lodge_id == "LDG-90211" for r in a.related_rfs)
 
-    # Trace covers 5 agents in order, Analyst marked ok with non-zero tokens.
+    # Trace: 5 agents in order + a trailing post-Formatter verifier review.
     agents = [s.agent.value for s in final.agent_trace]
     assert agents == ["classifier", "retrieval_planner",
-                      "analyst", "verifier", "formatter"]
+                      "analyst", "verifier", "formatter", "verifier"]
     analyst_step = final.agent_trace[2]
     assert analyst_step.status.value == "ok"
     assert analyst_step.input_tokens == 8000
@@ -477,6 +477,8 @@ async def test_must_retry_triggers_opus_then_succeeds(
             analyst_models_seen.append(kw["model"])
             return _llm_result(ANALYST_OUT, input_tokens=8000,
                                output_tokens=1500)
+        if sp.startswith("You are a verifier performing"):
+            return _llm_result({"flags": []})   # post-Formatter final review
         if sp.startswith("You are a verifier"):
             verifier_calls["n"] += 1
             if verifier_calls["n"] == 1:
@@ -513,12 +515,12 @@ async def test_must_retry_triggers_opus_then_succeeds(
     assert verifier_calls["n"] == 2
 
     # Trace shape: classifier, planner, analyst (sonnet), verifier(must_retry),
-    # analyst (opus), verifier(pass), formatter.
+    # analyst (opus), verifier(pass), formatter, verifier(final review).
     agents = [s.agent.value for s in final.agent_trace]
     assert agents == ["classifier", "retrieval_planner",
                       "analyst", "verifier",
                       "analyst", "verifier",
-                      "formatter"]
+                      "formatter", "verifier"]
     assert final.agent_trace[2].model == analyst_agent.MODEL_DEFAULT
     assert final.agent_trace[3].status.value == "retried"
     assert final.agent_trace[4].model == analyst_agent.MODEL_RETRY

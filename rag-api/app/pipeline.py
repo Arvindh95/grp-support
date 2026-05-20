@@ -125,16 +125,9 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
             llm_formatter.format_via_llm,
             cls_out, analyst_out, verifier_out, chunks,
         )
-        # The LLM Formatter doesn't see the upstream verifier flags directly
-        # in payload — it copies whatever the LLM emits. Backfill any flags
-        # the LLM dropped from verifier_out so we never silently lose them.
-        analysis = _backfill_verifier_flags(analysis, verifier_out.flags)
     except llm_formatter.FormatterError as e:
         log.warning('"pipeline.formatter_fallback err=%s"', e)
-        analysis = det_formatter.format_analysis(
-            cls_out, analyst_out, chunks,
-            extra_flags=verifier_out.flags,
-        )
+        analysis = det_formatter.format_analysis(cls_out, analyst_out, chunks)
         formatter_step = AgentStep(
             agent=AgentName.formatter, model="deterministic (fallback)",
             status=AgentStepStatus.failed, duration_ms=0,
@@ -143,6 +136,37 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
         )
     trace.append(formatter_step)
     _add_usage(usage, formatter_step)
+
+    # ── 7. Final review — re-verify the FINAL Analysis so verifier flags
+    #     reference its own step numbers / cit-ids. The pre-format Verifier
+    #     saw the Analyst draft; the Formatter may have renumbered actions,
+    #     leaving the original flags pointing at steps that no longer exist.
+    final_flags, reverify_step = await asyncio.to_thread(
+        verifier_agent.verify_analysis, analysis, chunks, cls_out.category,
+    )
+    trace.append(reverify_step)
+    _add_usage(usage, reverify_step)
+
+    # Carry the flags the final review cannot derive from the Analysis alone:
+    # pipeline-level low_confidence / retrieval_gap (Verifier soft-fail or
+    # Opus-retry degrade) and the Analyst's own unsupported-claim self-flag.
+    carried: list[VerifierFlag] = [
+        f for f in verifier_out.flags
+        if f.kind in (VerifierFlagKind.low_confidence,
+                      VerifierFlagKind.retrieval_gap)
+    ]
+    if analyst_out.unsupported_flag:
+        carried.append(VerifierFlag(
+            kind=VerifierFlagKind.unsupported_claim,
+            detail=f"Analyst self-flagged: {analyst_out.unsupported_flag}"[:400],
+        ))
+    if analyst_out.confidence < 0.20:
+        carried.append(VerifierFlag(
+            kind=VerifierFlagKind.low_confidence,
+            detail=f"Analyst confidence={analyst_out.confidence:.2f}",
+        ))
+    analysis = analysis.model_copy(
+        update={"verifier_flags": _merge_flags(final_flags, carried)})
 
     usage.estimated_cost_rm = _estimate_cost_rm(usage)
     log.info('"pipeline.done job=%s cost_rm=%.4f chunks=%d analyst_status=%s"',
@@ -153,23 +177,18 @@ async def run_pipeline(job: Job, rfs: RFS) -> tuple[Analysis, list[AgentStep], U
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _backfill_verifier_flags(analysis: Analysis,
-                             expected: list[VerifierFlag]) -> Analysis:
-    """If the LLM Formatter dropped any of the upstream verifier flags,
-    append them so they reach the caller. De-dupe by (kind, detail)."""
-    if not expected:
-        return analysis
-    seen = {(f.kind, f.detail) for f in analysis.verifier_flags}
-    new_flags = list(analysis.verifier_flags)
-    for f in expected:
+def _merge_flags(primary: list[VerifierFlag],
+                 extra: list[VerifierFlag]) -> list[VerifierFlag]:
+    """Concatenate two flag lists, de-duping by (kind, detail)."""
+    seen = {(f.kind, f.detail) for f in primary}
+    out = list(primary)
+    for f in extra:
         key = (f.kind, f.detail)
         if key in seen:
             continue
         seen.add(key)
-        new_flags.append(f)
-    if len(new_flags) == len(analysis.verifier_flags):
-        return analysis
-    return analysis.model_copy(update={"verifier_flags": new_flags})
+        out.append(f)
+    return out
 
 
 def _degrade_to_flag(v):
