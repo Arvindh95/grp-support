@@ -8,9 +8,8 @@ Type=simple
 User=claudeuser
 Group=claudeuser
 WorkingDirectory=/opt/grp-chat/rag-api
-Environment=PYTHONPATH=/home/claudeuser/.local/lib/python3.12/site-packages
 EnvironmentFile=/etc/rag-api.env
-ExecStart=/home/claudeuser/.local/bin/uvicorn app.main:app \
+ExecStart=/opt/grp-chat/rag-api/.venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 \
     --port 8001 \
     --workers 1 \
@@ -20,10 +19,11 @@ RestartSec=3
 KillSignal=SIGINT
 TimeoutStopSec=20
 
-# Hardening — ProtectHome omitted: uvicorn + deps live under /home/claudeuser/.local
+# Hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
