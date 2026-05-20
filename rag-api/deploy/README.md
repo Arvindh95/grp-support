@@ -9,8 +9,9 @@ VPS: `173.212.247.3`. Repo path: `/opt/grp-chat/rag-api`. Runs on loopback `:800
 cd /opt/grp-chat
 sudo -u claudeuser git pull
 
-# 2. Install python deps inside the existing venv (shared with grp-api).
-sudo -u claudeuser /opt/grp-chat/.venv/bin/pip install -r rag-api/requirements.txt
+# 2. Install python deps into claudeuser's --user site (shared with grp-api;
+#    grp-api runs the same way — no venv).
+sudo -u claudeuser python3 -m pip install --user -r rag-api/requirements.txt
 
 # 3. Env file
 sudo install -o root -g claudeuser -m 0640 \
@@ -68,7 +69,7 @@ Same flow as grp-api — pull, restart unit:
 
 ```bash
 cd /opt/grp-chat && sudo -u claudeuser git pull
-sudo -u claudeuser /opt/grp-chat/.venv/bin/pip install -r rag-api/requirements.txt
+sudo -u claudeuser python3 -m pip install --user -r rag-api/requirements.txt
 sudo systemctl restart rag-api
 journalctl -u rag-api -n 50 --no-pager
 ```
